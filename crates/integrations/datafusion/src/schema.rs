@@ -31,7 +31,9 @@ use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::{SqlViewRepresentation, ViewRepresentation};
 use iceberg::view::View;
-use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableCreation, TableIdent};
+use iceberg::{
+    Catalog, Error, ErrorKind, NamespaceIdent, Result, Runtime, TableCreation, TableIdent,
+};
 
 use crate::catalog::IcebergCatalogProvider;
 use crate::table::IcebergTableProvider;
@@ -54,19 +56,29 @@ pub(crate) struct IcebergSchemaProvider {
     view_names: Arc<DashMap<String, ()>>,
     /// A concurrent map where keys are view names and values are lazily planned view providers.
     views: Arc<DashMap<String, Arc<dyn TableProvider>>>,
+    /// Propagated to every [`IcebergTableProvider`] created by this provider.
+    runtime: Option<Runtime>,
 }
 
 impl IcebergSchemaProvider {
     /// Asynchronously tries to construct a new [`IcebergSchemaProvider`]
     /// using the given client to fetch and initialize table providers for
     /// the provided namespace in the Iceberg [`Catalog`].
-    ///
-    /// This method retrieves a list of table names
-    /// attempts to create a table provider for each table name, and
-    /// collects these providers into a `HashMap`.
     pub(crate) async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
+    ) -> Result<Self> {
+        Self::try_new_with_runtime(client, namespace, None).await
+    }
+
+    /// Like [`Self::try_new`], propagating `runtime` to every child table provider.
+    ///
+    /// `runtime` is propagated to every [`IcebergTableProvider`] created by
+    /// this schema provider.
+    pub(crate) async fn try_new_with_runtime(
+        client: Arc<dyn Catalog>,
+        namespace: NamespaceIdent,
+        runtime: Option<Runtime>,
     ) -> Result<Self> {
         // TODO:
         // Tables and providers should be cached based on table_name
@@ -87,7 +99,14 @@ impl IcebergSchemaProvider {
         let providers = try_join_all(
             table_names
                 .iter()
-                .map(|name| IcebergTableProvider::try_new(client.clone(), namespace.clone(), name))
+                .map(|name| {
+                    IcebergTableProvider::try_new_with_runtime(
+                        client.clone(),
+                        namespace.clone(),
+                        name,
+                        runtime.clone(),
+                    )
+                })
                 .collect::<Vec<_>>(),
         )
         .await?;
@@ -109,6 +128,7 @@ impl IcebergSchemaProvider {
             tables,
             view_names,
             views: Arc::new(DashMap::new()),
+            runtime,
         })
     }
 
@@ -136,9 +156,12 @@ impl IcebergSchemaProvider {
             .with_default_catalog_and_schema(default_catalog.clone(), default_schema)
             .with_create_default_catalog_and_schema(false);
         let session_ctx = SessionContext::new_with_config(session_config);
-        let catalog_provider = IcebergCatalogProvider::try_new(self.catalog.clone())
-            .await
-            .map_err(to_datafusion_error)?;
+        let catalog_provider = IcebergCatalogProvider::try_new_with_runtime(
+            self.catalog.clone(),
+            self.runtime.clone(),
+        )
+        .await
+        .map_err(to_datafusion_error)?;
 
         session_ctx.register_catalog(default_catalog, Arc::new(catalog_provider));
 
@@ -266,6 +289,7 @@ impl SchemaProvider for IcebergSchemaProvider {
         let namespace = self.namespace.clone();
         let tables = self.tables.clone();
         let name_clone = name.clone();
+        let runtime = self.runtime.clone();
 
         // Use tokio's spawn_blocking to handle the async work on a blocking thread pool
         let result = tokio::task::spawn_blocking(move || {
@@ -283,10 +307,11 @@ impl SchemaProvider for IcebergSchemaProvider {
                     .map_err(to_datafusion_error)?;
 
                 // Create a new table provider using the catalog reference
-                let table_provider = IcebergTableProvider::try_new(
+                let table_provider = IcebergTableProvider::try_new_with_runtime(
                     catalog.clone(),
                     namespace.clone(),
                     name_clone.clone(),
+                    runtime,
                 )
                 .await
                 .map_err(to_datafusion_error)?;
@@ -414,9 +439,10 @@ mod tests {
             .await
             .unwrap();
 
-        let provider = IcebergSchemaProvider::try_new(Arc::new(catalog), namespace)
-            .await
-            .unwrap();
+        let provider =
+            IcebergSchemaProvider::try_new_with_runtime(Arc::new(catalog), namespace, None)
+                .await
+                .unwrap();
 
         (provider, temp_dir)
     }
