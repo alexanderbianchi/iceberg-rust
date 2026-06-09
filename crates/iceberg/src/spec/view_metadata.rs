@@ -31,8 +31,11 @@ use uuid::Uuid;
 
 pub use super::view_metadata_builder::ViewMetadataBuilder;
 use super::view_version::{ViewVersionId, ViewVersionRef};
-use super::{SchemaId, SchemaRef};
+use super::{SchemaId, SchemaRef, parse_metadata_file_compression};
+use crate::catalog::MetadataLocation;
+use crate::compression::CompressionCodec;
 use crate::error::{Result, timestamp_ms_to_utc};
+use crate::io::FileIO;
 use crate::{Error, ErrorKind};
 
 /// Reference to [`ViewMetadata`].
@@ -159,6 +162,74 @@ impl ViewMetadata {
     #[inline]
     pub fn history(&self) -> &[ViewVersionLog] {
         &self.version_log
+    }
+
+    /// Read view metadata from the given location.
+    pub async fn read_from(
+        file_io: &FileIO,
+        metadata_location: impl AsRef<str>,
+    ) -> Result<ViewMetadata> {
+        let metadata_location = metadata_location.as_ref();
+        let input_file = file_io.new_input(metadata_location)?;
+        let metadata_content = input_file.read().await?;
+
+        let metadata = if metadata_content.len() > 2
+            && metadata_content[0] == 0x1F
+            && metadata_content[1] == 0x8B
+        {
+            let decompressed_data = CompressionCodec::gzip_default()
+                .decompress(metadata_content.to_vec())
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Trying to read compressed view metadata file",
+                    )
+                    .with_context("file_path", metadata_location)
+                    .with_source(e)
+                })?;
+            serde_json::from_slice(&decompressed_data)?
+        } else {
+            serde_json::from_slice(&metadata_content)?
+        };
+
+        Ok(metadata)
+    }
+
+    /// Write view metadata to the given location.
+    pub async fn write_to(
+        &self,
+        file_io: &FileIO,
+        metadata_location: &MetadataLocation,
+    ) -> Result<()> {
+        let json_data = serde_json::to_vec(self)?;
+        let codec = parse_metadata_file_compression(&self.properties)?;
+
+        if codec != metadata_location.compression_codec() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Compression codec mismatch: metadata_location has {:?}, but view properties specify {:?}",
+                    metadata_location.compression_codec(),
+                    codec
+                ),
+            ));
+        }
+
+        let data_to_write = match codec {
+            CompressionCodec::Gzip(_) => codec.compress(json_data)?,
+            CompressionCodec::None => json_data,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Unsupported metadata compression codec: {codec:?}"),
+                ));
+            }
+        };
+
+        file_io
+            .new_output(metadata_location.to_string())?
+            .write(data_to_write.into())
+            .await
     }
 
     /// Validate the view metadata.

@@ -25,6 +25,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::table::Table;
+use iceberg::view::View;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime,
     TableCommit, TableCreation, TableIdent,
@@ -42,8 +43,8 @@ use crate::client::{
 };
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
-    CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadTableResult,
-    NamespaceResponse, RegisterTableRequest, RenameTableRequest,
+    CreateTableRequest, ListNamespaceResponse, ListTablesResponse, ListViewsResponse,
+    LoadTableResult, LoadViewResult, NamespaceResponse, RegisterTableRequest, RenameTableRequest,
 };
 
 /// REST catalog URI
@@ -198,6 +199,10 @@ impl RestCatalogConfig {
         self.url_prefixed(&["namespaces", &ns.to_url_string(), "tables"])
     }
 
+    fn views_endpoint(&self, ns: &NamespaceIdent) -> String {
+        self.url_prefixed(&["namespaces", &ns.to_url_string(), "views"])
+    }
+
     fn rename_table_endpoint(&self) -> String {
         self.url_prefixed(&["tables", "rename"])
     }
@@ -212,6 +217,15 @@ impl RestCatalogConfig {
             &table.namespace.to_url_string(),
             "tables",
             &table.name,
+        ])
+    }
+
+    fn view_endpoint(&self, view: &TableIdent) -> String {
+        self.url_prefixed(&[
+            "namespaces",
+            &view.namespace.to_url_string(),
+            "views",
+            &view.name,
         ])
     }
 
@@ -730,6 +744,52 @@ impl Catalog for RestCatalog {
         Ok(identifiers)
     }
 
+    async fn list_views(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
+        let context = self.context().await?;
+        let endpoint = context.config.views_endpoint(namespace);
+        let mut identifiers = Vec::new();
+        let mut next_token = None;
+
+        loop {
+            let mut request = context.client.request(Method::GET, endpoint.clone());
+
+            if let Some(token) = next_token {
+                request = request.query(&[("pageToken", token)]);
+            }
+
+            let http_response = context.client.query_catalog(request.build()?).await?;
+
+            match http_response.status() {
+                StatusCode::OK => {
+                    let response =
+                        deserialize_catalog_response::<ListViewsResponse>(http_response).await?;
+
+                    identifiers.extend(response.identifiers);
+
+                    match response.next_page_token {
+                        Some(token) => next_token = Some(token),
+                        None => break,
+                    }
+                }
+                StatusCode::NOT_FOUND => {
+                    return Err(Error::new(
+                        ErrorKind::NamespaceNotFound,
+                        "Tried to list views of a namespace that does not exist",
+                    ));
+                }
+                _ => {
+                    return Err(deserialize_unexpected_catalog_error(
+                        http_response,
+                        context.client.disable_header_redaction(),
+                    )
+                    .await);
+                }
+            }
+        }
+
+        Ok(identifiers)
+    }
+
     /// Create a new table inside the namespace.
     ///
     /// In the resulting table, if there are any config properties that
@@ -871,6 +931,47 @@ impl Catalog for RestCatalog {
         }
     }
 
+    /// Load view from the catalog.
+    async fn load_view(&self, view_ident: &TableIdent) -> Result<View> {
+        let context = self.context().await?;
+
+        let request = context
+            .client
+            .request(Method::GET, context.config.view_endpoint(view_ident))
+            .build()?;
+
+        let http_response = context.client.query_catalog(request).await?;
+
+        let response = match http_response.status() {
+            StatusCode::OK | StatusCode::NOT_MODIFIED => {
+                deserialize_catalog_response::<LoadViewResult>(http_response).await?
+            }
+            StatusCode::NOT_FOUND => {
+                return Err(Error::new(
+                    ErrorKind::TableNotFound,
+                    "Tried to load a view that does not exist",
+                ));
+            }
+            _ => {
+                return Err(deserialize_unexpected_catalog_error(
+                    http_response,
+                    context.client.disable_header_redaction(),
+                )
+                .await);
+            }
+        };
+
+        let view_builder = View::builder()
+            .identifier(view_ident.clone())
+            .metadata(response.metadata);
+
+        if let Some(metadata_location) = response.metadata_location {
+            view_builder.metadata_location(metadata_location).build()
+        } else {
+            view_builder.build()
+        }
+    }
+
     /// Drop a table from the catalog.
     async fn drop_table(&self, table: &TableIdent) -> Result<()> {
         self.delete_table(table, false).await
@@ -889,6 +990,28 @@ impl Catalog for RestCatalog {
         let request = context
             .client
             .request(Method::HEAD, context.config.table_endpoint(table))
+            .build()?;
+
+        let http_response = context.client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::NO_CONTENT | StatusCode::OK => Ok(true),
+            StatusCode::NOT_FOUND => Ok(false),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                context.client.disable_header_redaction(),
+            )
+            .await),
+        }
+    }
+
+    /// Check if a view exists in the catalog.
+    async fn view_exists(&self, view: &TableIdent) -> Result<bool> {
+        let context = self.context().await?;
+
+        let request = context
+            .client
+            .request(Method::HEAD, context.config.view_endpoint(view))
             .build()?;
 
         let http_response = context.client.query_catalog(request).await?;
@@ -2200,6 +2323,183 @@ mod tests {
 
         config_mock.assert_async().await;
         check_table_exists_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_views() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock(&mut server).await;
+
+        let list_views_mock = server
+            .mock("GET", "/v1/namespaces/ns1/views")
+            .with_status(200)
+            .with_body(
+                r#"{
+                "identifiers": [
+                    {
+                        "namespace": ["ns1"],
+                        "name": "view1"
+                    },
+                    {
+                        "namespace": ["ns1"],
+                        "name": "view2"
+                    }
+                ]
+            }"#,
+            )
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+        );
+
+        let views = catalog
+            .list_views(&NamespaceIdent::new("ns1".to_string()))
+            .await
+            .unwrap();
+
+        let expected_views = vec![
+            TableIdent::new(NamespaceIdent::new("ns1".to_string()), "view1".to_string()),
+            TableIdent::new(NamespaceIdent::new("ns1".to_string()), "view2".to_string()),
+        ];
+
+        assert_eq!(views, expected_views);
+
+        config_mock.assert_async().await;
+        list_views_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_check_view_exists() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock(&mut server).await;
+
+        let check_view_exists_mock = server
+            .mock("HEAD", "/v1/namespaces/ns1/views/view1")
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+        );
+
+        assert!(
+            catalog
+                .view_exists(&TableIdent::new(
+                    NamespaceIdent::new("ns1".to_string()),
+                    "view1".to_string(),
+                ))
+                .await
+                .unwrap()
+        );
+
+        config_mock.assert_async().await;
+        check_view_exists_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_load_view() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock(&mut server).await;
+        let metadata_location = "s3://warehouse/database/view/metadata/00000-view.metadata.json";
+
+        let load_view_mock = server
+            .mock("GET", "/v1/namespaces/ns1/views/view1")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "metadata-location": metadata_location,
+                    "metadata": {
+                        "view-uuid": "fa6506c3-7681-40c8-86dc-e36561f83385",
+                        "format-version": 1,
+                        "location": "s3://warehouse/database/view",
+                        "current-version-id": 1,
+                        "properties": {
+                            "comment": "Daily event counts"
+                        },
+                        "versions": [
+                            {
+                                "version-id": 1,
+                                "timestamp-ms": 1573518431292_i64,
+                                "schema-id": 1,
+                                "default-catalog": "datafusion",
+                                "default-namespace": ["ns1"],
+                                "summary": {
+                                    "engine-name": "DataFusion"
+                                },
+                                "representations": [
+                                    {
+                                        "type": "sql",
+                                        "sql": "SELECT foo FROM table1",
+                                        "dialect": "datafusion"
+                                    }
+                                ]
+                            }
+                        ],
+                        "schemas": [
+                            {
+                                "schema-id": 1,
+                                "type": "struct",
+                                "fields": [
+                                    {
+                                        "id": 1,
+                                        "name": "foo",
+                                        "required": false,
+                                        "type": "int"
+                                    }
+                                ]
+                            }
+                        ],
+                        "version-log": [
+                            {
+                                "timestamp-ms": 1573518431292_i64,
+                                "version-id": 1
+                            }
+                        ]
+                    },
+                    "config": {}
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+        );
+
+        let view = catalog
+            .load_view(&TableIdent::new(
+                NamespaceIdent::new("ns1".to_string()),
+                "view1".to_string(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            &TableIdent::from_strs(vec!["ns1", "view1"]).unwrap(),
+            view.identifier()
+        );
+        assert_eq!(Some(metadata_location), view.metadata_location());
+        assert_eq!("s3://warehouse/database/view", view.metadata().location());
+        assert_eq!(
+            "SELECT foo FROM table1",
+            view.sql_for("datafusion").unwrap().sql
+        );
+
+        config_mock.assert_async().await;
+        load_view_mock.assert_async().await;
     }
 
     #[tokio::test]

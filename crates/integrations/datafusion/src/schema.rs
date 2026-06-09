@@ -21,16 +21,19 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use datafusion::catalog::SchemaProvider;
-use datafusion::datasource::TableProvider;
+use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use futures::future::try_join_all;
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::inspect::MetadataTableType;
+use iceberg::spec::{SqlViewRepresentation, ViewRepresentation};
+use iceberg::view::View;
 use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableCreation, TableIdent};
 
+use crate::catalog::IcebergCatalogProvider;
 use crate::table::IcebergTableProvider;
 use crate::to_datafusion_error;
 
@@ -47,6 +50,10 @@ pub(crate) struct IcebergSchemaProvider {
     /// [`TableProvider`] trait.
     /// Wrapped in Arc to allow sharing across async boundaries in register_table.
     tables: Arc<DashMap<String, Arc<IcebergTableProvider>>>,
+    /// A concurrent map where keys are known view names in this namespace.
+    view_names: Arc<DashMap<String, ()>>,
+    /// A concurrent map where keys are view names and values are lazily planned view providers.
+    views: Arc<DashMap<String, Arc<dyn TableProvider>>>,
 }
 
 impl IcebergSchemaProvider {
@@ -71,6 +78,11 @@ impl IcebergSchemaProvider {
             .iter()
             .map(|tbl| tbl.name().to_string())
             .collect();
+        let view_names: Vec<_> = match client.list_views(&namespace).await {
+            Ok(views) => views.iter().map(|view| view.name().to_string()).collect(),
+            Err(err) if err.kind() == ErrorKind::FeatureUnsupported => Vec::new(),
+            Err(err) => return Err(err),
+        };
 
         let providers = try_join_all(
             table_names
@@ -84,13 +96,76 @@ impl IcebergSchemaProvider {
         for (name, provider) in table_names.into_iter().zip(providers.into_iter()) {
             tables.insert(name, Arc::new(provider));
         }
+        let view_names = Arc::new(
+            view_names
+                .into_iter()
+                .map(|name| (name, ()))
+                .collect::<DashMap<_, _>>(),
+        );
 
         Ok(IcebergSchemaProvider {
             catalog: client,
             namespace,
             tables,
+            view_names,
+            views: Arc::new(DashMap::new()),
         })
     }
+
+    async fn load_view_provider(&self, name: &str) -> DFResult<Arc<dyn TableProvider>> {
+        let view_ident = TableIdent::new(self.namespace.clone(), name.to_string());
+        let view = self
+            .catalog
+            .load_view(&view_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+        let sql = select_view_sql(&view).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Iceberg view {} has no SQL representation",
+                view.identifier()
+            ))
+        })?;
+        let sql_definition = sql.sql.clone();
+        let version = view.current_version();
+        let default_catalog = version
+            .default_catalog()
+            .cloned()
+            .unwrap_or_else(|| "datafusion".to_string());
+        let default_schema = version.default_namespace().to_string();
+        let session_config = SessionConfig::new()
+            .with_default_catalog_and_schema(default_catalog.clone(), default_schema)
+            .with_create_default_catalog_and_schema(false);
+        let session_ctx = SessionContext::new_with_config(session_config);
+        let catalog_provider = IcebergCatalogProvider::try_new(self.catalog.clone())
+            .await
+            .map_err(to_datafusion_error)?;
+
+        session_ctx.register_catalog(default_catalog, Arc::new(catalog_provider));
+
+        let plan = session_ctx
+            .state()
+            .create_logical_plan(&sql_definition)
+            .await?;
+        let provider =
+            Arc::new(ViewTable::new(plan, Some(sql_definition))) as Arc<dyn TableProvider>;
+
+        Ok(provider)
+    }
+}
+
+fn select_view_sql(view: &View) -> Option<&SqlViewRepresentation> {
+    view.sql_for("datafusion")
+        .or_else(|| view.sql_for("spark"))
+        .or_else(|| view.sql_for("ansi"))
+        .or_else(|| {
+            view.current_version()
+                .representations()
+                .iter()
+                .map(|repr| match repr {
+                    ViewRepresentation::Sql(sql) => sql,
+                })
+                .next()
+        })
 }
 
 #[async_trait]
@@ -100,7 +175,8 @@ impl SchemaProvider for IcebergSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.tables
+        let mut names = self
+            .tables
             .iter()
             .flat_map(|entry| {
                 let table_name = entry.key().clone();
@@ -112,7 +188,11 @@ impl SchemaProvider for IcebergSchemaProvider {
                         }),
                     )
             })
-            .collect()
+            .collect::<Vec<_>>();
+        names.extend(self.view_names.iter().map(|entry| entry.key().clone()));
+        names.sort();
+        names.dedup();
+        names
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -121,6 +201,8 @@ impl SchemaProvider for IcebergSchemaProvider {
                 && MetadataTableType::try_from(metadata_table_name).is_ok()
         } else {
             self.tables.contains_key(name)
+                || self.view_names.contains_key(name)
+                || self.views.contains_key(name)
         }
     }
 
@@ -139,10 +221,21 @@ impl SchemaProvider for IcebergSchemaProvider {
             }
         }
 
-        Ok(self
-            .tables
-            .get(name)
-            .map(|entry| entry.value().clone() as Arc<dyn TableProvider>))
+        if let Some(table) = self.tables.get(name) {
+            return Ok(Some(table.value().clone() as Arc<dyn TableProvider>));
+        }
+
+        if let Some(view) = self.views.get(name) {
+            return Ok(Some(view.value().clone()));
+        }
+
+        if self.view_names.contains_key(name) {
+            let view = self.load_view_provider(name).await?;
+            self.views.insert(name.to_string(), view.clone());
+            return Ok(Some(view));
+        }
+
+        Ok(None)
     }
 
     fn register_table(
@@ -213,8 +306,12 @@ impl SchemaProvider for IcebergSchemaProvider {
     }
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        // Check if table exists
-        if !self.table_exist(name) {
+        if !self.tables.contains_key(name) {
+            if self.view_names.contains_key(name) || self.views.contains_key(name) {
+                return Err(DataFusionError::Execution(format!(
+                    "Dropping Iceberg view {name} is not supported"
+                )));
+            }
             return Ok(None);
         }
 
@@ -291,8 +388,10 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
+    use datafusion::logical_expr::TableType;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+    use iceberg::spec::{SqlViewRepresentation, ViewRepresentation, ViewRepresentations};
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, ViewCreation};
     use tempfile::TempDir;
 
     use super::*;
@@ -312,6 +411,65 @@ mod tests {
         let namespace = NamespaceIdent::new("test_ns".to_string());
         catalog
             .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+
+        let provider = IcebergSchemaProvider::try_new(Arc::new(catalog), namespace)
+            .await
+            .unwrap();
+
+        (provider, temp_dir)
+    }
+
+    async fn create_test_schema_provider_with_view() -> (IcebergSchemaProvider, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_path = temp_dir.path().to_str().unwrap().to_string();
+
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
+            )
+            .await
+            .unwrap();
+
+        let namespace = NamespaceIdent::new("test_ns".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+
+        let arrow_schema = ArrowSchema::new(vec![Field::new("foo", DataType::Int32, false)]);
+        let iceberg_schema = arrow_schema_to_schema_auto_assign_ids(&arrow_schema).unwrap();
+
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("tbl1".to_string())
+                    .schema(iceberg_schema.clone())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        catalog
+            .create_view(
+                &namespace,
+                ViewCreation::builder()
+                    .name("view1".to_string())
+                    .location(format!("{warehouse_path}/test_ns/view1"))
+                    .schema(iceberg_schema)
+                    .representations(ViewRepresentations::new(vec![ViewRepresentation::Sql(
+                        SqlViewRepresentation {
+                            sql: "SELECT foo FROM tbl1".to_string(),
+                            dialect: "datafusion".to_string(),
+                        },
+                    )]))
+                    .default_namespace(namespace.clone())
+                    .default_catalog(Some("datafusion".to_string()))
+                    .build(),
+            )
             .await
             .unwrap();
 
@@ -441,5 +599,35 @@ mod tests {
         let result = schema_provider.deregister_table("nonexistent");
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_table_names_include_views() {
+        let (schema_provider, _temp_dir) = create_test_schema_provider_with_view().await;
+
+        let table_names = schema_provider.table_names();
+
+        assert!(table_names.contains(&"tbl1".to_string()));
+        assert!(table_names.contains(&"view1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_table_loads_iceberg_view_as_datafusion_view() {
+        let (schema_provider, _temp_dir) = create_test_schema_provider_with_view().await;
+
+        let view_provider = schema_provider.table("view1").await.unwrap().unwrap();
+
+        assert_eq!(view_provider.table_type(), TableType::View);
+        assert_eq!(view_provider.schema().field(0).name(), "foo");
+    }
+
+    #[tokio::test]
+    async fn test_deregister_view_is_not_supported() {
+        let (schema_provider, _temp_dir) = create_test_schema_provider_with_view().await;
+
+        let result = schema_provider.deregister_table("view1");
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not supported"));
     }
 }

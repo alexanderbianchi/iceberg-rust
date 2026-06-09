@@ -22,7 +22,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::compression::CompressionCodec;
-use crate::spec::{TableMetadata, parse_metadata_file_compression};
+use crate::spec::{TableMetadata, ViewMetadata, parse_metadata_file_compression};
 use crate::{Error, ErrorKind, Result};
 
 /// Helper for parsing a location of the format: `<location>/metadata/<version>-<uuid>.metadata.json`
@@ -63,6 +63,18 @@ impl MetadataLocation {
     pub fn new_with_metadata(table_location: impl ToString, metadata: &TableMetadata) -> Self {
         Self {
             table_location: table_location.to_string(),
+            version: 0,
+            id: Uuid::new_v4(),
+            compression_codec: Self::compression_from_properties(metadata.properties()),
+        }
+    }
+
+    /// Creates a completely new metadata location starting at version 0,
+    /// with compression settings from the view metadata.
+    /// Only used for creating a new view. For updates, see `next_version`.
+    pub fn new_with_view_metadata(view_location: impl ToString, metadata: &ViewMetadata) -> Self {
+        Self {
+            table_location: view_location.to_string(),
             version: 0,
             id: Uuid::new_v4(),
             compression_codec: Self::compression_from_properties(metadata.properties()),

@@ -31,6 +31,8 @@ pub(crate) struct NamespaceState {
     namespaces: HashMap<String, NamespaceState>,
     // Mapping of tables to metadata locations in this namespace
     table_metadata_locations: HashMap<String, String>,
+    // Mapping of views to metadata locations in this namespace
+    view_metadata_locations: HashMap<String, String>,
 }
 
 fn no_such_namespace_err<T>(namespace_ident: &NamespaceIdent) -> Result<T> {
@@ -47,6 +49,13 @@ fn no_such_table_err<T>(table_ident: &TableIdent) -> Result<T> {
     ))
 }
 
+fn no_such_view_err<T>(view_ident: &TableIdent) -> Result<T> {
+    Err(Error::new(
+        ErrorKind::TableNotFound,
+        format!("No such view: {view_ident:?}"),
+    ))
+}
+
 fn namespace_already_exists_err<T>(namespace_ident: &NamespaceIdent) -> Result<T> {
     Err(Error::new(
         ErrorKind::NamespaceAlreadyExists,
@@ -58,6 +67,13 @@ fn table_already_exists_err<T>(table_ident: &TableIdent) -> Result<T> {
     Err(Error::new(
         ErrorKind::TableAlreadyExists,
         format!("Cannot create table {table_ident:?}. Table already exists."),
+    ))
+}
+
+fn view_already_exists_err<T>(view_ident: &TableIdent) -> Result<T> {
+    Err(Error::new(
+        ErrorKind::TableAlreadyExists,
+        format!("Cannot create view {view_ident:?}. View already exists."),
     ))
 }
 
@@ -171,6 +187,7 @@ impl NamespaceState {
                     properties,
                     namespaces: HashMap::new(),
                     table_metadata_locations: HashMap::new(),
+                    view_metadata_locations: HashMap::new(),
                 });
 
                 Ok(())
@@ -238,6 +255,17 @@ impl NamespaceState {
         Ok(table_names)
     }
 
+    // Returns the list of view names under the given namespace
+    pub(crate) fn list_views(&self, namespace_ident: &NamespaceIdent) -> Result<Vec<&String>> {
+        let view_names = self
+            .get_namespace(namespace_ident)?
+            .view_metadata_locations
+            .keys()
+            .collect_vec();
+
+        Ok(view_names)
+    }
+
     // Returns true if the given table exists, otherwise false
     pub(crate) fn table_exists(&self, table_ident: &TableIdent) -> Result<bool> {
         let namespace_state = self.get_namespace(table_ident.namespace())?;
@@ -246,6 +274,16 @@ impl NamespaceState {
             .contains_key(&table_ident.name);
 
         Ok(table_exists)
+    }
+
+    // Returns true if the given view exists, otherwise false
+    pub(crate) fn view_exists(&self, view_ident: &TableIdent) -> Result<bool> {
+        let namespace_state = self.get_namespace(view_ident.namespace())?;
+        let view_exists = namespace_state
+            .view_metadata_locations
+            .contains_key(&view_ident.name);
+
+        Ok(view_exists)
     }
 
     // Returns the metadata location of the given table or an error if doesn't exist
@@ -258,6 +296,16 @@ impl NamespaceState {
         }
     }
 
+    // Returns the metadata location of the given view or an error if doesn't exist
+    pub(crate) fn get_existing_view_location(&self, view_ident: &TableIdent) -> Result<&String> {
+        let namespace = self.get_namespace(view_ident.namespace())?;
+
+        match namespace.view_metadata_locations.get(view_ident.name()) {
+            None => no_such_view_err(view_ident),
+            Some(view_metadata_location) => Ok(view_metadata_location),
+        }
+    }
+
     // Inserts the given table or returns an error if it already exists
     pub(crate) fn insert_new_table(
         &mut self,
@@ -266,11 +314,46 @@ impl NamespaceState {
     ) -> Result<()> {
         let namespace = self.get_mut_namespace(table_ident.namespace())?;
 
+        if namespace
+            .view_metadata_locations
+            .contains_key(table_ident.name())
+        {
+            return table_already_exists_err(table_ident);
+        }
+
         match namespace
             .table_metadata_locations
             .entry(table_ident.name().to_string())
         {
             hash_map::Entry::Occupied(_) => table_already_exists_err(table_ident),
+            hash_map::Entry::Vacant(entry) => {
+                let _ = entry.insert(metadata_location);
+
+                Ok(())
+            }
+        }
+    }
+
+    // Inserts the given view or returns an error if it already exists
+    pub(crate) fn insert_new_view(
+        &mut self,
+        view_ident: &TableIdent,
+        metadata_location: String,
+    ) -> Result<()> {
+        let namespace = self.get_mut_namespace(view_ident.namespace())?;
+
+        if namespace
+            .table_metadata_locations
+            .contains_key(view_ident.name())
+        {
+            return view_already_exists_err(view_ident);
+        }
+
+        match namespace
+            .view_metadata_locations
+            .entry(view_ident.name().to_string())
+        {
+            hash_map::Entry::Occupied(_) => view_already_exists_err(view_ident),
             hash_map::Entry::Vacant(entry) => {
                 let _ = entry.insert(metadata_location);
 

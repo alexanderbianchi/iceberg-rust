@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use iceberg::spec::{Schema, SortOrder, TableMetadata, UnboundPartitionSpec};
+use iceberg::spec::{Schema, SortOrder, TableMetadata, UnboundPartitionSpec, ViewMetadata};
 use iceberg::{
     Error, ErrorKind, Namespace, NamespaceIdent, TableIdent, TableRequirement, TableUpdate,
 };
@@ -189,6 +189,18 @@ pub struct ListTablesResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+/// Response containing a list of view identifiers, with optional pagination support.
+pub struct ListViewsResponse {
+    /// List of view identifiers under the requested namespace
+    pub identifiers: Vec<TableIdent>,
+    /// Opaque token for pagination. If present, indicates there are more results available.
+    /// Use this value in subsequent requests to retrieve the next page.
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// Request to rename a table from one identifier to another.
 ///
 /// It's valid to move a table across namespaces, but the server implementation
@@ -224,6 +236,22 @@ pub struct LoadTableResult {
     /// before falling back to credentials in the `config` field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_credentials: Option<Vec<StorageCredential>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+/// Result returned when a view is successfully loaded.
+///
+/// The view metadata JSON is returned in the `metadata` field. The corresponding file location
+/// of view metadata should be returned in the `metadata_location` field.
+pub struct LoadViewResult {
+    /// May be null if the view metadata has not been committed to a file
+    pub metadata_location: Option<String>,
+    /// The view's full metadata
+    pub metadata: ViewMetadata,
+    /// View-specific configuration overriding catalog configuration
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub config: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

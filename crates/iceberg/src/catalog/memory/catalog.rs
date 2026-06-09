@@ -28,11 +28,12 @@ use itertools::Itertools;
 use super::namespace_state::NamespaceState;
 use crate::io::{FileIO, FileIOBuilder, MemoryStorageFactory, StorageFactory};
 use crate::runtime::Runtime;
-use crate::spec::{TableMetadata, TableMetadataBuilder};
+use crate::spec::{TableMetadata, TableMetadataBuilder, ViewMetadata, ViewMetadataBuilder};
 use crate::table::Table;
+use crate::view::View;
 use crate::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent,
+    TableCommit, TableCreation, TableIdent, ViewCreation,
 };
 
 /// Memory catalog warehouse location
@@ -168,6 +169,22 @@ impl MemoryCatalog {
             .runtime(self.runtime.clone())
             .build()
     }
+
+    /// Loads a view from the locked namespace state.
+    async fn load_view_from_locked_state(
+        &self,
+        view_ident: &TableIdent,
+        root_namespace_state: &MutexGuard<'_, NamespaceState>,
+    ) -> Result<View> {
+        let metadata_location = root_namespace_state.get_existing_view_location(view_ident)?;
+        let metadata = ViewMetadata::read_from(&self.file_io, metadata_location).await?;
+
+        View::builder()
+            .identifier(view_ident.clone())
+            .metadata(metadata)
+            .metadata_location(metadata_location.to_string())
+            .build()
+    }
 }
 
 #[async_trait]
@@ -275,6 +292,19 @@ impl Catalog for MemoryCatalog {
         Ok(table_idents)
     }
 
+    /// List views from namespace.
+    async fn list_views(&self, namespace_ident: &NamespaceIdent) -> Result<Vec<TableIdent>> {
+        let root_namespace_state = self.root_namespace_state.lock().await;
+
+        let view_names = root_namespace_state.list_views(namespace_ident)?;
+        let view_idents = view_names
+            .into_iter()
+            .map(|view_name| TableIdent::new(namespace_ident.clone(), view_name.clone()))
+            .collect_vec();
+
+        Ok(view_idents)
+    }
+
     /// Create a new table inside the namespace.
     async fn create_table(
         &self,
@@ -324,11 +354,47 @@ impl Catalog for MemoryCatalog {
             .build()
     }
 
+    /// Create a new view inside the namespace.
+    async fn create_view(
+        &self,
+        namespace_ident: &NamespaceIdent,
+        view_creation: ViewCreation,
+    ) -> Result<View> {
+        let mut root_namespace_state = self.root_namespace_state.lock().await;
+
+        let view_name = view_creation.name.clone();
+        let view_ident = TableIdent::new(namespace_ident.clone(), view_name);
+        let location = view_creation.location.clone();
+
+        let metadata = ViewMetadataBuilder::from_view_creation(view_creation)?
+            .build()?
+            .metadata;
+        let metadata_location = MetadataLocation::new_with_view_metadata(location, &metadata);
+
+        metadata.write_to(&self.file_io, &metadata_location).await?;
+
+        root_namespace_state.insert_new_view(&view_ident, metadata_location.to_string())?;
+
+        View::builder()
+            .metadata_location(metadata_location.to_string())
+            .metadata(metadata)
+            .identifier(view_ident)
+            .build()
+    }
+
     /// Load table from the catalog.
     async fn load_table(&self, table_ident: &TableIdent) -> Result<Table> {
         let root_namespace_state = self.root_namespace_state.lock().await;
 
         self.load_table_from_locked_state(table_ident, &root_namespace_state)
+            .await
+    }
+
+    /// Load view from the catalog.
+    async fn load_view(&self, view_ident: &TableIdent) -> Result<View> {
+        let root_namespace_state = self.root_namespace_state.lock().await;
+
+        self.load_view_from_locked_state(view_ident, &root_namespace_state)
             .await
     }
 
@@ -351,6 +417,13 @@ impl Catalog for MemoryCatalog {
         let root_namespace_state = self.root_namespace_state.lock().await;
 
         root_namespace_state.table_exists(table_ident)
+    }
+
+    /// Check if a view exists in the catalog.
+    async fn view_exists(&self, view_ident: &TableIdent) -> Result<bool> {
+        let root_namespace_state = self.root_namespace_state.lock().await;
+
+        root_namespace_state.view_exists(view_ident)
     }
 
     /// Rename a table in the catalog.
@@ -428,10 +501,15 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::Tabular;
     use crate::io::FileIO;
-    use crate::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type};
+    use crate::spec::{
+        NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, SqlViewRepresentation, Type,
+        ViewRepresentation, ViewRepresentations,
+    };
     use crate::test_utils::test_runtime;
     use crate::transaction::{ApplyTransactionAction, Transaction};
+    use crate::view::View;
 
     fn temp_path() -> String {
         let temp_dir = TempDir::new().unwrap();
@@ -500,6 +578,28 @@ pub(crate) mod tests {
 
         let table_ident = TableIdent::new(namespace_ident, "test".to_string());
         create_table(catalog, &table_ident).await
+    }
+
+    async fn create_view<C: Catalog>(catalog: &C, view_ident: &TableIdent) -> View {
+        catalog
+            .create_view(
+                &view_ident.namespace,
+                ViewCreation::builder()
+                    .name(view_ident.name().to_string())
+                    .location(format!("{}/{}", temp_path(), view_ident.name()))
+                    .schema(simple_table_schema())
+                    .representations(ViewRepresentations::new(vec![ViewRepresentation::Sql(
+                        SqlViewRepresentation {
+                            sql: "SELECT foo FROM tbl1".to_string(),
+                            dialect: "datafusion".to_string(),
+                        },
+                    )]))
+                    .default_namespace(view_ident.namespace.clone())
+                    .default_catalog(Some("datafusion".to_string()))
+                    .build(),
+            )
+            .await
+            .unwrap()
     }
 
     fn assert_table_eq(table: &Table, expected_table_ident: &TableIdent, expected_schema: &Schema) {
@@ -1522,6 +1622,99 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .to_string(),
             format!("NamespaceNotFound => No such namespace: {non_existent_namespace_ident:?}"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_and_load_view() {
+        let catalog = new_memory_catalog().await;
+        let namespace_ident = NamespaceIdent::new("n1".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let view_ident = TableIdent::new(namespace_ident.clone(), "view1".into());
+        let created = create_view(&catalog, &view_ident).await;
+        let loaded = catalog.load_view(&view_ident).await.unwrap();
+
+        assert_eq!(created.identifier(), &view_ident);
+        assert_eq!(loaded.identifier(), &view_ident);
+        assert_eq!(loaded.current_schema().as_ref(), &simple_table_schema());
+        assert!(loaded.metadata_location().is_some());
+        assert_eq!(
+            loaded.sql_for("datafusion").unwrap().sql,
+            "SELECT foo FROM tbl1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_views_returns_a_single_view() {
+        let catalog = new_memory_catalog().await;
+        let namespace_ident = NamespaceIdent::new("n1".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let view_ident = TableIdent::new(namespace_ident.clone(), "view1".into());
+        create_view(&catalog, &view_ident).await;
+
+        assert_eq!(catalog.list_views(&namespace_ident).await.unwrap(), vec![
+            view_ident
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_view_exists_returns_true_and_false() {
+        let catalog = new_memory_catalog().await;
+        let namespace_ident = NamespaceIdent::new("n1".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let view_ident = TableIdent::new(namespace_ident.clone(), "view1".into());
+        create_view(&catalog, &view_ident).await;
+
+        assert!(catalog.view_exists(&view_ident).await.unwrap());
+        assert!(
+            !catalog
+                .view_exists(&TableIdent::new(namespace_ident, "missing".into()))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_tabular_returns_view() {
+        let catalog = new_memory_catalog().await;
+        let namespace_ident = NamespaceIdent::new("n1".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let view_ident = TableIdent::new(namespace_ident, "view1".into());
+        create_view(&catalog, &view_ident).await;
+
+        let tabular = catalog.load_tabular(&view_ident).await.unwrap();
+        match tabular {
+            Tabular::View(view) => assert_eq!(view.identifier(), &view_ident),
+            Tabular::Table(_) => panic!("Expected view tabular"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_table_throws_error_if_view_with_same_name_exists() {
+        let catalog = new_memory_catalog().await;
+        let namespace_ident = NamespaceIdent::new("n1".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let ident = TableIdent::new(namespace_ident.clone(), "same_name".into());
+        create_view(&catalog, &ident).await;
+
+        assert_eq!(
+            catalog
+                .create_table(
+                    &namespace_ident,
+                    TableCreation::builder()
+                        .name(ident.name().to_string())
+                        .schema(simple_table_schema())
+                        .build()
+                )
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::TableAlreadyExists
         );
     }
 

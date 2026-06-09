@@ -47,6 +47,7 @@ use crate::spec::{
     UnboundPartitionSpec, ViewFormatVersion, ViewRepresentations, ViewVersion,
 };
 use crate::table::Table;
+use crate::view::View;
 use crate::{Error, ErrorKind, Result};
 
 /// The catalog API for Iceberg Rust.
@@ -119,6 +120,90 @@ pub trait Catalog: Debug + Sync + Send {
 
     /// Update a table to the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table>;
+
+    /// List views from namespace.
+    async fn list_views(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
+        let _ = namespace;
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Listing views is not supported by this catalog",
+        ))
+    }
+
+    /// Create a new view inside the namespace.
+    async fn create_view(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: ViewCreation,
+    ) -> Result<View> {
+        let _ = namespace;
+        let _ = creation;
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Creating views is not supported by this catalog",
+        ))
+    }
+
+    /// Load a view from the catalog.
+    async fn load_view(&self, view: &TableIdent) -> Result<View> {
+        let _ = view;
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Loading views is not supported by this catalog",
+        ))
+    }
+
+    /// Check if a view exists in the catalog.
+    async fn view_exists(&self, view: &TableIdent) -> Result<bool> {
+        match self.load_view(view).await {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == ErrorKind::TableNotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Load a table-like catalog object from the catalog.
+    async fn load_tabular(&self, ident: &TableIdent) -> Result<Tabular> {
+        let table_err = match self.load_table(ident).await {
+            Ok(table) => return Ok(Tabular::Table(table)),
+            Err(err) if err.kind() == ErrorKind::TableNotFound => err,
+            Err(err) => return Err(err),
+        };
+
+        match self.load_view(ident).await {
+            Ok(view) => Ok(Tabular::View(view)),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::TableNotFound | ErrorKind::FeatureUnsupported
+                ) =>
+            {
+                Err(table_err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// A table-like catalog object.
+#[derive(Debug, Clone)]
+pub enum Tabular {
+    /// A physical Iceberg table.
+    Table(Table),
+    /// A logical Iceberg view.
+    View(View),
+}
+
+impl From<Table> for Tabular {
+    fn from(table: Table) -> Self {
+        Self::Table(table)
+    }
+}
+
+impl From<View> for Tabular {
+    fn from(view: View) -> Self {
+        Self::View(view)
+    }
 }
 
 /// Common interface for all catalog builders.

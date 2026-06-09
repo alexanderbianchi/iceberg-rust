@@ -163,6 +163,11 @@ impl ViewVersion {
 pub struct ViewRepresentations(pub(crate) Vec<ViewRepresentation>);
 
 impl ViewRepresentations {
+    /// Creates a new list of view representations.
+    pub fn new(representations: Vec<ViewRepresentation>) -> Self {
+        Self(representations)
+    }
+
     #[inline]
     /// Get the number of representations
     pub fn len(&self) -> usize {
