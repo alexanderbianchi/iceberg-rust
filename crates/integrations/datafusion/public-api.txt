@@ -110,6 +110,14 @@ impl core::default::Default for iceberg_datafusion::IcebergOptions
 pub fn iceberg_datafusion::IcebergOptions::default() -> iceberg_datafusion::IcebergOptions
 impl core::fmt::Debug for iceberg_datafusion::IcebergOptions
 pub fn iceberg_datafusion::IcebergOptions::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct iceberg_datafusion::IcebergSessionCatalogProvider
+impl iceberg_datafusion::IcebergSessionCatalogProvider
+pub async fn iceberg_datafusion::IcebergSessionCatalogProvider::for_session(&self, options: iceberg_datafusion::IcebergOptions) -> iceberg::error::Result<iceberg_datafusion::IcebergCatalogProvider>
+pub fn iceberg_datafusion::IcebergSessionCatalogProvider::new(inner: alloc::sync::Arc<dyn iceberg::catalog::session::SessionCatalog>) -> Self
+impl core::clone::Clone for iceberg_datafusion::IcebergSessionCatalogProvider
+pub fn iceberg_datafusion::IcebergSessionCatalogProvider::clone(&self) -> iceberg_datafusion::IcebergSessionCatalogProvider
+impl core::fmt::Debug for iceberg_datafusion::IcebergSessionCatalogProvider
+pub fn iceberg_datafusion::IcebergSessionCatalogProvider::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg_datafusion::IcebergStaticTableProvider
 impl iceberg_datafusion::IcebergStaticTableProvider
 pub async fn iceberg_datafusion::IcebergStaticTableProvider::try_new_from_table(table: iceberg::table::Table) -> iceberg::error::Result<Self>

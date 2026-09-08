@@ -25,6 +25,18 @@
 //!
 //! The adapter at the bottom only makes the example self-contained. Applications
 //! should pass their own `SessionCatalog` implementation to the provider.
+//!
+//! This example shows two ways of connecting a session-aware catalog:
+//!
+//! 1. [`IcebergCatalogProvider::try_new_with_session_catalog`] discovers
+//!    namespaces and tables once with a shared, anonymous fallback context,
+//!    then binds a DataFusion session's identity for later scans and
+//!    inserts.
+//! 2. [`IcebergSessionCatalogProvider::for_session`] resolves the identity
+//!    *before* the first discovery call, so catalogs with identity-dependent
+//!    visibility discover the right namespaces and tables from the start.
+//!    This is regular DataFusion SQL setup: no Substrait or other special
+//!    planning hook is required.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,7 +50,7 @@ use iceberg::{
     Catalog, CatalogBuilder, Namespace, NamespaceIdent, Result, SessionCatalog,
     SessionContext as IcebergSessionContext, TableCommit, TableCreation, TableIdent,
 };
-use iceberg_datafusion::{IcebergCatalogProvider, IcebergOptions};
+use iceberg_datafusion::{IcebergCatalogProvider, IcebergOptions, IcebergSessionCatalogProvider};
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -46,10 +58,14 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         init_catalog_with_table(TableIdent::from_strs(["datafusion", "example"])?).await?;
 
     let session_catalog = Arc::new(ExampleSessionCatalog::new(catalog));
+
+    // Approach 1: discovery-first, DataFusion session bound afterwards.
+    //
     // Provider construction discovers namespaces and tables with one stable,
     // anonymous fallback context. Session-dependent catalogs must make that
     // discovery set available to the fallback context.
-    let provider = IcebergCatalogProvider::try_new_with_session_catalog(session_catalog).await?;
+    let discovery_first_provider =
+        IcebergCatalogProvider::try_new_with_session_catalog(session_catalog.clone()).await?;
 
     let iceberg_options = IcebergOptions {
         identity: Some("user123".to_string()),
@@ -58,12 +74,35 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let config = SessionConfig::new().with_extension(Arc::new(iceberg_options));
     let datafusion = DataFusionSessionContext::new_with_config(config);
-    datafusion.register_catalog("iceberg", Arc::new(provider));
+    datafusion.register_catalog("iceberg", Arc::new(discovery_first_provider));
 
     // Planning the scan derives an Iceberg context from the DataFusion session
     // and its IcebergOptions, then forwards it to the session catalog's
     // `load_table` operation.
     datafusion
+        .sql("SELECT COUNT(*) AS event_count FROM iceberg.datafusion.example")
+        .await?
+        .show()
+        .await?;
+
+    // Approach 2: bind the identity before the first discovery call.
+    //
+    // `IcebergSessionCatalogProvider::new` performs no catalog I/O. Each call
+    // to `for_session` resolves an Iceberg session context from the given
+    // `IcebergOptions` first, then runs namespace and table discovery under
+    // that context, so a catalog with identity-dependent visibility sees the
+    // right identity from its very first request.
+    let query_bound_factory = IcebergSessionCatalogProvider::new(session_catalog);
+    let query_bound_provider = query_bound_factory
+        .for_session(IcebergOptions {
+            identity: Some("user123".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+    let query_bound_datafusion = DataFusionSessionContext::new();
+    query_bound_datafusion.register_catalog("iceberg", Arc::new(query_bound_provider));
+    query_bound_datafusion
         .sql("SELECT COUNT(*) AS event_count FROM iceberg.datafusion.example")
         .await?
         .show()

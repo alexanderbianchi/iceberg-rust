@@ -24,8 +24,8 @@ use iceberg::sensitive::SensitiveString;
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::table::Table;
 use iceberg::{
-    Catalog, CatalogBuilder, Namespace, NamespaceIdent, Result, SessionCatalog, SessionContext,
-    TableCommit, TableCreation, TableIdent,
+    Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, SessionCatalog,
+    SessionContext, TableCommit, TableCreation, TableIdent,
 };
 use tempfile::TempDir;
 
@@ -262,4 +262,246 @@ pub(crate) fn iceberg_options() -> Arc<IcebergOptions> {
             SensitiveString::from("test-secret".to_string()),
         )]),
     })
+}
+
+/// A [`SessionCatalog`] whose namespace and table visibility depends on the
+/// bound identity, and which rejects anonymous (identity-less) access.
+///
+/// Used to test that query-bound catalog providers resolve their identity
+/// *before* the first discovery call, and that separate bindings do not
+/// leak or share each other's discovered namespaces or tables.
+#[derive(Debug)]
+pub(crate) struct IdentityScopedSessionCatalog {
+    inner: Arc<dyn Catalog>,
+    calls: Mutex<Vec<CatalogCall>>,
+}
+
+impl IdentityScopedSessionCatalog {
+    fn new(inner: Arc<dyn Catalog>) -> Self {
+        Self {
+            inner,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn calls(&self) -> Vec<CatalogCall> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    pub(crate) fn clear_calls(&self) {
+        self.calls.lock().unwrap().clear();
+    }
+
+    fn record(&self, operation: &'static str, context: &SessionContext) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(CatalogCall::new(operation, context));
+    }
+
+    fn require_identity<'a>(&self, context: &'a SessionContext) -> Result<&'a str> {
+        context
+            .identity()
+            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "anonymous access is not permitted"))
+    }
+
+    /// Every identity gets its own, disjoint namespace: `<identity>_ns`.
+    pub(crate) fn namespace_for_identity(identity: &str) -> NamespaceIdent {
+        NamespaceIdent::new(format!("{identity}_ns"))
+    }
+}
+
+#[async_trait]
+impl SessionCatalog for IdentityScopedSessionCatalog {
+    async fn list_namespaces(
+        &self,
+        context: &SessionContext,
+        parent: Option<&NamespaceIdent>,
+    ) -> Result<Vec<NamespaceIdent>> {
+        self.record("list_namespaces", context);
+        let identity = self.require_identity(context)?;
+        if parent.is_some() {
+            return Ok(vec![]);
+        }
+        Ok(vec![Self::namespace_for_identity(identity)])
+    }
+
+    async fn create_namespace(
+        &self,
+        context: &SessionContext,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> Result<Namespace> {
+        self.record("create_namespace", context);
+        self.require_identity(context)?;
+        self.inner.create_namespace(namespace, properties).await
+    }
+
+    async fn get_namespace(
+        &self,
+        context: &SessionContext,
+        namespace: &NamespaceIdent,
+    ) -> Result<Namespace> {
+        self.record("get_namespace", context);
+        self.require_identity(context)?;
+        self.inner.get_namespace(namespace).await
+    }
+
+    async fn namespace_exists(
+        &self,
+        context: &SessionContext,
+        namespace: &NamespaceIdent,
+    ) -> Result<bool> {
+        self.record("namespace_exists", context);
+        self.require_identity(context)?;
+        self.inner.namespace_exists(namespace).await
+    }
+
+    async fn update_namespace(
+        &self,
+        context: &SessionContext,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> Result<()> {
+        self.record("update_namespace", context);
+        self.require_identity(context)?;
+        self.inner.update_namespace(namespace, properties).await
+    }
+
+    async fn drop_namespace(
+        &self,
+        context: &SessionContext,
+        namespace: &NamespaceIdent,
+    ) -> Result<()> {
+        self.record("drop_namespace", context);
+        self.require_identity(context)?;
+        self.inner.drop_namespace(namespace).await
+    }
+
+    async fn list_tables(
+        &self,
+        context: &SessionContext,
+        namespace: &NamespaceIdent,
+    ) -> Result<Vec<TableIdent>> {
+        self.record("list_tables", context);
+        let identity = self.require_identity(context)?;
+        if namespace != &Self::namespace_for_identity(identity) {
+            return Ok(vec![]);
+        }
+        self.inner.list_tables(namespace).await
+    }
+
+    async fn create_table(
+        &self,
+        context: &SessionContext,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> Result<Table> {
+        self.record("create_table", context);
+        self.require_identity(context)?;
+        self.inner.create_table(namespace, creation).await
+    }
+
+    async fn load_table(&self, context: &SessionContext, table: &TableIdent) -> Result<Table> {
+        self.record("load_table", context);
+        let identity = self.require_identity(context)?;
+        if table.namespace() != &Self::namespace_for_identity(identity) {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("table {table} is not visible to identity {identity}"),
+            ));
+        }
+        self.inner.load_table(table).await
+    }
+
+    async fn drop_table(&self, context: &SessionContext, table: &TableIdent) -> Result<()> {
+        self.record("drop_table", context);
+        self.require_identity(context)?;
+        self.inner.drop_table(table).await
+    }
+
+    async fn purge_table(&self, context: &SessionContext, table: &TableIdent) -> Result<()> {
+        self.record("purge_table", context);
+        self.require_identity(context)?;
+        self.inner.purge_table(table).await
+    }
+
+    async fn table_exists(&self, context: &SessionContext, table: &TableIdent) -> Result<bool> {
+        self.record("table_exists", context);
+        self.require_identity(context)?;
+        self.inner.table_exists(table).await
+    }
+
+    async fn rename_table(
+        &self,
+        context: &SessionContext,
+        src: &TableIdent,
+        dest: &TableIdent,
+    ) -> Result<()> {
+        self.record("rename_table", context);
+        self.require_identity(context)?;
+        self.inner.rename_table(src, dest).await
+    }
+
+    async fn register_table(
+        &self,
+        context: &SessionContext,
+        table: &TableIdent,
+        metadata_location: String,
+    ) -> Result<Table> {
+        self.record("register_table", context);
+        self.require_identity(context)?;
+        self.inner.register_table(table, metadata_location).await
+    }
+
+    async fn update_table(&self, context: &SessionContext, commit: TableCommit) -> Result<Table> {
+        self.record("update_table", context);
+        self.require_identity(context)?;
+        self.inner.update_table(commit).await
+    }
+}
+
+/// Builds an [`IdentityScopedSessionCatalog`] with one namespace and table
+/// pre-created for each of `"alice"` and `"bob"`, disjoint from each other.
+pub(crate) async fn create_identity_scoped_catalog() -> (Arc<IdentityScopedSessionCatalog>, TempDir)
+{
+    let temp_dir = TempDir::new().unwrap();
+    let warehouse_path = temp_dir.path().to_str().unwrap().to_string();
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
+            )
+            .await
+            .unwrap(),
+    );
+
+    for identity in ["alice", "bob"] {
+        let namespace = IdentityScopedSessionCatalog::namespace_for_identity(identity);
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+        let table_name = format!("{identity}_table");
+        let creation = TableCreation::builder()
+            .name(table_name.clone())
+            .location(format!("{warehouse_path}/{table_name}"))
+            .schema(schema)
+            .build();
+        catalog.create_table(&namespace, creation).await.unwrap();
+    }
+
+    (
+        Arc::new(IdentityScopedSessionCatalog::new(catalog)),
+        temp_dir,
+    )
 }

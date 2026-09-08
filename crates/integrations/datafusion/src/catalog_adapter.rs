@@ -28,24 +28,53 @@ use iceberg::{
 
 use crate::options::resolve_session_context;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Binding {
+    /// DataFusion session options may replace the fallback context.
+    Fallback,
+    /// All operations retain the context chosen before discovery.
+    Explicit,
+}
+
 /// Adapts a [`SessionCatalog`] to [`Catalog`] by binding one [`SessionContext`].
 ///
 /// Every catalog operation is forwarded to the inner session-aware catalog
-/// with the same context. The binding is fixed for the lifetime of this
-/// adapter; create another adapter to use a different session context.
+/// with the same context. Whether that context can later be replaced by one
+/// derived from a DataFusion session depends on the adapter's [`Binding`];
+/// see [`SessionBindingCatalogAdapter::with_session`]. Create another adapter
+/// to use a different session context outright.
 #[derive(Clone, Debug)]
 pub(crate) struct SessionBindingCatalogAdapter {
     context: SessionContext,
     inner: Arc<dyn SessionCatalog>,
+    binding: Binding,
 }
 
 impl SessionBindingCatalogAdapter {
-    /// Creates a catalog view of `inner` bound to `context`.
+    /// Creates a fallback catalog view of `inner` bound to `context`.
     ///
-    /// The inner catalog receives this context for every operation performed
-    /// through the returned adapter.
+    /// The context is used until [`Self::with_session`] observes a DataFusion
+    /// session carrying [`crate::IcebergOptions`], at which point it is
+    /// replaced by a context derived from that session. Use
+    /// [`Self::new_explicit`] for a context that must stay fixed.
     pub(crate) fn new(context: SessionContext, inner: Arc<dyn SessionCatalog>) -> Self {
-        Self { context, inner }
+        Self {
+            context,
+            inner,
+            binding: Binding::Fallback,
+        }
+    }
+
+    /// Creates a catalog view of `inner` explicitly bound to `context`.
+    ///
+    /// [`Self::with_session`] never replaces this context; initial discovery
+    /// and later scans must use the same binding.
+    pub(crate) fn new_explicit(context: SessionContext, inner: Arc<dyn SessionCatalog>) -> Self {
+        Self {
+            context,
+            inner,
+            binding: Binding::Explicit,
+        }
     }
 
     /// Adapts a plain, session-unaware catalog to a [`SessionBindingCatalogAdapter`].
@@ -56,12 +85,19 @@ impl SessionBindingCatalogAdapter {
         Self::new(SessionContext::empty(), Arc::new(session_catalog))
     }
 
-    /// Overwrites the already bound, usually shared fallback session, with
-    /// a provided session, usually from a DataFusion query.
+    /// For a [`Binding::Fallback`] adapter, overwrites the bound context with
+    /// one derived from `session`'s [`crate::IcebergOptions`], if present.
+    ///
+    /// Explicit bindings return themselves unchanged, even if the DataFusion
+    /// session carries conflicting options.
     pub(crate) fn with_session(
         self: &Arc<Self>,
         session: &dyn Session,
     ) -> Arc<SessionBindingCatalogAdapter> {
+        if self.binding == Binding::Explicit {
+            return Arc::clone(self);
+        }
+
         match resolve_session_context(session) {
             None => Arc::clone(self),
             Some(context) => Arc::new(SessionBindingCatalogAdapter::new(

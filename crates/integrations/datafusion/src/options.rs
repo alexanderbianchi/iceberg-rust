@@ -43,23 +43,53 @@ pub struct IcebergOptions {
     pub credentials: HashMap<String, SensitiveString>,
 }
 
-/// Derives an Iceberg session context from a DataFusion session and its
-/// configured [`IcebergOptions`], if registered.
-pub(crate) fn resolve_session_context(session: &dyn DFSession) -> Option<SessionContext> {
-    let options = session.config().get_extension::<IcebergOptions>()?;
+impl IcebergOptions {
+    /// Builds a fresh Iceberg [`SessionContext`] from these options.
+    ///
+    /// Unlike the DataFusion session-derived context used by
+    /// [`resolve_session_context`], this generates a new, unique session id
+    /// on every call rather than reusing a DataFusion session identifier.
+    /// This is intended for query- or session-scoped catalog bindings that
+    /// are resolved independently of any particular DataFusion session, for
+    /// example one binding created per incoming query.
+    pub(crate) fn to_session_context(&self) -> SessionContext {
+        build_session_context(self, None)
+    }
+}
 
+/// Centralizes the mapping from [`IcebergOptions`] to an Iceberg
+/// [`SessionContext`], optionally overriding the generated session id.
+///
+/// When `session_id` is `None`, the underlying builder assigns a fresh,
+/// unique id.
+fn build_session_context(options: &IcebergOptions, session_id: Option<String>) -> SessionContext {
     let builder = SessionContext::builder()
-        .session_id(session.session_id().to_string())
         .properties(options.properties.clone())
         .credentials(options.credentials.clone());
 
-    let context = if let Some(identity) = &options.identity {
-        builder.identity(identity.to_string()).build()
-    } else {
-        builder.build()
-    };
+    match (session_id, &options.identity) {
+        (Some(session_id), Some(identity)) => builder
+            .session_id(session_id)
+            .identity(identity.clone())
+            .build(),
+        (Some(session_id), None) => builder.session_id(session_id).build(),
+        (None, Some(identity)) => builder.identity(identity.clone()).build(),
+        (None, None) => builder.build(),
+    }
+}
 
-    Some(context)
+/// Derives an Iceberg session context from a DataFusion session and its
+/// configured [`IcebergOptions`], if registered.
+///
+/// The returned context reuses the DataFusion session's id. Query- or
+/// session-scoped bindings that are independent of a DataFusion session
+/// should use [`IcebergOptions::to_session_context`] instead.
+pub(crate) fn resolve_session_context(session: &dyn DFSession) -> Option<SessionContext> {
+    let options = session.config().get_extension::<IcebergOptions>()?;
+    Some(build_session_context(
+        &options,
+        Some(session.session_id().to_string()),
+    ))
 }
 
 #[cfg(test)]
@@ -87,6 +117,26 @@ mod tests {
         assert!(context.identity().is_none());
         assert!(context.properties().is_empty());
         assert!(context.credentials().is_empty());
+    }
+
+    #[test]
+    fn test_to_session_context_generates_unique_ids() {
+        let options = IcebergOptions {
+            identity: Some("query-user".to_string()),
+            properties: HashMap::from([("prop".to_string(), "value".to_string())]),
+            credentials: HashMap::from([(
+                "token".to_string(),
+                SensitiveString::from("secret".to_string()),
+            )]),
+        };
+
+        let first = options.to_session_context();
+        let second = options.to_session_context();
+
+        assert_ne!(first.session_id(), second.session_id());
+        assert_eq!(first.identity(), Some("query-user"));
+        assert_eq!(first.properties(), &options.properties);
+        assert_eq!(first.credentials(), &options.credentials);
     }
 
     #[test]

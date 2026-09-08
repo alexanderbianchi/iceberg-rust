@@ -22,7 +22,7 @@ mod catalog_adapter;
 mod catalog_provider;
 pub use options::IcebergOptions;
 mod options;
-pub use catalog_provider::*;
+pub use catalog_provider::{IcebergCatalogProvider, IcebergSessionCatalogProvider};
 pub mod physical_plan;
 mod schema_provider;
 pub mod table;

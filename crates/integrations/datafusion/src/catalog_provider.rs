@@ -23,6 +23,7 @@ use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent, Result, SessionCatalog, SessionContext};
 
 use crate::catalog_adapter::SessionBindingCatalogAdapter;
+use crate::options::IcebergOptions;
 use crate::schema_provider::IcebergSchemaProvider;
 
 /// Provides a DataFusion interface to schemas in an Iceberg [`Catalog`] or
@@ -94,6 +95,53 @@ impl CatalogProvider for IcebergCatalogProvider {
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
         self.schemas.get(name).cloned()
+    }
+}
+
+/// Creates providers whose query context is bound before catalog discovery.
+///
+/// Unlike [`IcebergCatalogProvider::try_new_with_session_catalog`], this factory
+/// does not use an anonymous fallback for initial namespace, table, or schema
+/// loading. [`Self::for_session`] supplies the caller's [`IcebergOptions`] to
+/// those operations as well as subsequent scans, inserts, and metadata lookups.
+///
+/// Factory construction performs no catalog I/O. Each binding eagerly discovers
+/// its own namespaces and tables, sharing only the underlying [`SessionCatalog`]
+/// (and its transport), not the discovered providers. Create a new binding for
+/// each query or context requiring distinct visibility; there is no cross-binding
+/// discovery cache or automatic refresh of discovered names.
+#[derive(Debug, Clone)]
+pub struct IcebergSessionCatalogProvider {
+    inner: Arc<dyn SessionCatalog>,
+}
+
+impl IcebergSessionCatalogProvider {
+    /// Creates a factory over `inner`. Performs no catalog I/O.
+    pub fn new(inner: Arc<dyn SessionCatalog>) -> Self {
+        Self { inner }
+    }
+
+    /// Resolves an [`iceberg::SessionContext`] from `options`, then builds an
+    /// [`IcebergCatalogProvider`] whose namespace and table discovery, and
+    /// whose subsequent scan, insert, metadata-lookup, and
+    /// register/deregister operations, all use that same context.
+    ///
+    /// The resolved context is explicitly bound: it stays fixed for the
+    /// lifetime of the returned provider and is never overwritten by a
+    /// DataFusion session's [`IcebergOptions`], even if that session carries
+    /// different or conflicting options. Call this again to create another
+    /// binding for another query or context. Each binding receives a fresh
+    /// Iceberg session ID, independent of any DataFusion session ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if namespace/table discovery or initial schema loading
+    /// fails under the supplied context.
+    pub async fn for_session(&self, options: IcebergOptions) -> Result<IcebergCatalogProvider> {
+        let context = options.to_session_context();
+        let session_bound =
+            SessionBindingCatalogAdapter::new_explicit(context, Arc::clone(&self.inner));
+        IcebergCatalogProvider::try_new_with_binding_catalog(Arc::new(session_bound)).await
     }
 }
 
@@ -331,5 +379,279 @@ mod tests {
                 && call.properties.is_empty()
                 && call.credentials.is_empty()
         }));
+    }
+
+    #[tokio::test]
+    async fn test_factory_construction_performs_no_catalog_io() {
+        let (session_catalog, _temp_dir) = test_utils::create_identity_scoped_catalog().await;
+
+        let _factory = IcebergSessionCatalogProvider::new(session_catalog.clone());
+
+        assert!(
+            session_catalog.calls().is_empty(),
+            "constructing the factory must not touch the catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_for_session_binds_identity_before_first_discovery_call() {
+        let (session_catalog, _temp_dir) = test_utils::create_identity_scoped_catalog().await;
+        let factory = IcebergSessionCatalogProvider::new(session_catalog.clone());
+
+        let options = IcebergOptions {
+            identity: Some("alice".to_string()),
+            properties: HashMap::from([("region".to_string(), "us-east".to_string())]),
+            credentials: HashMap::from([(
+                "token".to_string(),
+                SensitiveString::from("alice-secret".to_string()),
+            )]),
+        };
+
+        let provider = factory.for_session(options.clone()).await.unwrap();
+
+        let calls = session_catalog.calls();
+        assert_eq!(
+            calls.iter().map(|call| call.operation).collect::<Vec<_>>(),
+            vec!["list_namespaces", "list_tables", "load_table"]
+        );
+        assert!(calls.iter().all(|call| {
+            call.identity == options.identity
+                && call.properties == options.properties
+                && call.credentials == options.credentials
+        }));
+
+        // The bound identity determined what got discovered.
+        assert_eq!(provider.schema_names(), vec!["alice_ns".to_string()]);
+        let schema = provider.schema("alice_ns").unwrap();
+        assert!(schema.table_exist("alice_table"));
+    }
+
+    #[tokio::test]
+    async fn test_for_session_rejects_anonymous_catalog_by_default_but_allows_binding() {
+        let (session_catalog, _temp_dir) = test_utils::create_identity_scoped_catalog().await;
+        let factory = IcebergSessionCatalogProvider::new(session_catalog.clone());
+
+        // Anonymous discovery (no identity bound) is rejected by this catalog.
+        let error = factory
+            .for_session(IcebergOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), iceberg::ErrorKind::DataInvalid);
+        assert!(
+            error
+                .to_string()
+                .contains("anonymous access is not permitted")
+        );
+
+        // An explicitly bound identity can still initialize successfully.
+        let provider = factory
+            .for_session(IcebergOptions {
+                identity: Some("bob".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(provider.schema_names(), vec!["bob_ns".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_two_bindings_do_not_share_discovered_visibility() {
+        let (session_catalog, _temp_dir) = test_utils::create_identity_scoped_catalog().await;
+        let factory = IcebergSessionCatalogProvider::new(session_catalog.clone());
+
+        let (alice_provider, bob_provider) = tokio::try_join!(
+            factory.for_session(IcebergOptions {
+                identity: Some("alice".to_string()),
+                ..Default::default()
+            }),
+            factory.for_session(IcebergOptions {
+                identity: Some("bob".to_string()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(alice_provider.schema_names(), vec!["alice_ns".to_string()]);
+        assert_eq!(bob_provider.schema_names(), vec!["bob_ns".to_string()]);
+
+        assert!(alice_provider.schema("bob_ns").is_none());
+        assert!(bob_provider.schema("alice_ns").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_explicit_binding_survives_scan_without_datafusion_options() {
+        let (session_catalog, _temp_dir) = test_utils::create_identity_scoped_catalog().await;
+        let factory = IcebergSessionCatalogProvider::new(session_catalog.clone());
+
+        let provider = factory
+            .for_session(IcebergOptions {
+                identity: Some("alice".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let bound_session_id = session_catalog.calls()[0].session_id.clone();
+        session_catalog.clear_calls();
+
+        let schema = provider.schema("alice_ns").unwrap();
+        let table = schema.table("alice_table").await.unwrap().unwrap();
+
+        // No IcebergOptions extension registered on this DataFusion session.
+        let df_context = DFSessionContext::new();
+        table
+            .scan(&df_context.state(), None, &[], None)
+            .await
+            .unwrap();
+
+        let calls = session_catalog.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].operation, "load_table");
+        assert_eq!(calls[0].session_id, bound_session_id);
+        assert_eq!(calls[0].identity, Some("alice".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_explicit_binding_survives_scan_with_conflicting_datafusion_options() {
+        let (session_catalog, _temp_dir) = test_utils::create_identity_scoped_catalog().await;
+        let factory = IcebergSessionCatalogProvider::new(session_catalog.clone());
+
+        let provider = factory
+            .for_session(IcebergOptions {
+                identity: Some("alice".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let bound_session_id = session_catalog.calls()[0].session_id.clone();
+        session_catalog.clear_calls();
+
+        let schema = provider.schema("alice_ns").unwrap();
+        let table = schema.table("alice_table").await.unwrap().unwrap();
+
+        // A DataFusion session carrying a *different* identity must not
+        // override the explicitly bound context.
+        let conflicting_options = Arc::new(IcebergOptions {
+            identity: Some("bob".to_string()),
+            ..Default::default()
+        });
+        let config = SessionConfig::new().with_extension(conflicting_options);
+        let df_context = DFSessionContext::new_with_config(config);
+        table
+            .scan(&df_context.state(), None, &[], None)
+            .await
+            .unwrap();
+
+        let calls = session_catalog.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].operation, "load_table");
+        assert_eq!(calls[0].session_id, bound_session_id);
+        assert_ne!(calls[0].session_id, df_context.session_id());
+        assert_eq!(
+            calls[0].identity,
+            Some("alice".to_string()),
+            "explicit binding must not be overwritten by conflicting DataFusion IcebergOptions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explicit_binding_survives_metadata_lookup_and_sql_commit() {
+        let (session_catalog, namespace, table_name, _temp_dir) =
+            test_utils::create_recording_catalog().await;
+        let factory = IcebergSessionCatalogProvider::new(session_catalog.clone());
+        let options = test_utils::iceberg_options();
+        let provider = factory.for_session(options.as_ref().clone()).await.unwrap();
+        let bound_session_id = session_catalog.calls()[0].session_id.clone();
+        session_catalog.clear_calls();
+
+        let schema = provider.schema(namespace[0].as_str()).unwrap();
+        schema
+            .table(&format!("{table_name}$snapshots"))
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata_calls = session_catalog.calls();
+        assert_eq!(metadata_calls.len(), 1);
+        assert_eq!(metadata_calls[0].operation, "load_table");
+        session_catalog.clear_calls();
+
+        let config = SessionConfig::new().with_extension(Arc::new(IcebergOptions {
+            identity: Some("conflicting-user".to_string()),
+            ..Default::default()
+        }));
+        let session = DFSessionContext::new_with_config(config);
+        session.register_catalog("iceberg", Arc::new(provider));
+        session
+            .sql("INSERT INTO iceberg.test_ns.test_table VALUES (1, 'test')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let calls = session_catalog.calls();
+        assert!(calls.iter().any(|call| call.operation == "load_table"));
+        assert!(calls.iter().any(|call| call.operation == "update_table"));
+        assert!(metadata_calls.iter().chain(calls.iter()).all(|call| {
+            call.session_id == bound_session_id
+                && call.identity == options.identity
+                && call.properties == options.properties
+                && call.credentials == options.credentials
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_binding_uses_one_context_id_throughout_and_distinct_ids_between_bindings() {
+        let (session_catalog, _temp_dir) = test_utils::create_identity_scoped_catalog().await;
+        let factory = IcebergSessionCatalogProvider::new(session_catalog.clone());
+
+        let first_provider = factory
+            .for_session(IcebergOptions {
+                identity: Some("alice".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let first_bootstrap_calls = session_catalog.calls();
+        session_catalog.clear_calls();
+
+        let _second_provider = factory
+            .for_session(IcebergOptions {
+                identity: Some("alice".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let second_bootstrap_calls = session_catalog.calls();
+        session_catalog.clear_calls();
+
+        let first_session_id = first_bootstrap_calls[0].session_id.clone();
+        let second_session_id = second_bootstrap_calls[0].session_id.clone();
+        assert!(
+            first_bootstrap_calls
+                .iter()
+                .all(|call| call.session_id == first_session_id)
+        );
+        assert!(
+            second_bootstrap_calls
+                .iter()
+                .all(|call| call.session_id == second_session_id)
+        );
+        assert_ne!(
+            first_session_id, second_session_id,
+            "distinct bindings must get distinct context ids even with identical options"
+        );
+
+        // The first binding's context id remains stable across further
+        // operations on that binding: scanning re-loads table metadata
+        // through the same bound context.
+        let schema = first_provider.schema("alice_ns").unwrap();
+        let table = schema.table("alice_table").await.unwrap().unwrap();
+        let df_context = DFSessionContext::new();
+        table
+            .scan(&df_context.state(), None, &[], None)
+            .await
+            .unwrap();
+        let calls = session_catalog.calls();
+        assert_eq!(calls.last().unwrap().session_id, first_session_id);
     }
 }
