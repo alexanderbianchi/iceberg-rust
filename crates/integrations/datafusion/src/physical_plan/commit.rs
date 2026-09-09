@@ -29,11 +29,11 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
-use iceberg::Catalog;
 use iceberg::spec::{DataFile, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
+use crate::catalog_access::CatalogAccess;
 use crate::physical_plan::DATA_FILES_COL_NAME;
 use crate::to_datafusion_error;
 
@@ -42,7 +42,7 @@ use crate::to_datafusion_error;
 #[derive(Debug)]
 pub(crate) struct IcebergCommitExec {
     table: Table,
-    catalog: Arc<dyn Catalog>,
+    catalog: CatalogAccess,
     input: Arc<dyn ExecutionPlan>,
     schema: ArrowSchemaRef,
     count_schema: ArrowSchemaRef,
@@ -52,10 +52,11 @@ pub(crate) struct IcebergCommitExec {
 impl IcebergCommitExec {
     pub fn new(
         table: Table,
-        catalog: Arc<dyn Catalog>,
+        catalog: impl Into<CatalogAccess>,
         input: Arc<dyn ExecutionPlan>,
         schema: ArrowSchemaRef,
     ) -> Self {
+        let catalog = catalog.into();
         let count_schema = Self::make_count_schema();
 
         let plan_properties = Self::compute_properties(Arc::clone(&count_schema));
@@ -183,7 +184,7 @@ impl ExecutionPlan for IcebergCommitExec {
         let partition_type = self.table.metadata().default_partition_type().clone();
         let current_schema = self.table.metadata().current_schema().clone();
 
-        let catalog = Arc::clone(&self.catalog);
+        let catalog = self.catalog.clone();
 
         // Process the input streams from all partitions and commit the data files
         let stream = futures::stream::once(async move {
@@ -247,7 +248,7 @@ impl ExecutionPlan for IcebergCommitExec {
             let _updated_table = action
                 .apply(tx)
                 .map_err(to_datafusion_error)?
-                .commit(catalog.as_ref())
+                .commit(&catalog)
                 .await
                 .map_err(to_datafusion_error)?;
 

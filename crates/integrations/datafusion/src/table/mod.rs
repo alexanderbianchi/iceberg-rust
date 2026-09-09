@@ -48,6 +48,7 @@ use iceberg::table::Table;
 use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
 
+use crate::catalog_access::CatalogAccess;
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
 use crate::physical_plan::project::project_with_partition;
@@ -67,7 +68,7 @@ use crate::physical_plan::write::IcebergWriteExec;
 #[derive(Debug, Clone)]
 pub struct IcebergTableProvider {
     /// The catalog that manages this table
-    catalog: Arc<dyn Catalog>,
+    catalog: CatalogAccess,
     /// The table identifier (namespace + name)
     table_ident: TableIdent,
     /// A reference-counted arrow `Schema` (cached at construction)
@@ -80,10 +81,11 @@ impl IcebergTableProvider {
     /// Loads the table once to get the initial schema, then stores the catalog
     /// reference for future metadata refreshes on each operation.
     pub(crate) async fn try_new(
-        catalog: Arc<dyn Catalog>,
+        catalog: impl Into<CatalogAccess>,
         namespace: NamespaceIdent,
         name: impl Into<String>,
     ) -> Result<Self> {
+        let catalog = catalog.into();
         let table_ident = TableIdent::new(namespace, name.into());
 
         // Load table once to get initial schema
