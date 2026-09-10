@@ -45,10 +45,10 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::table::Table;
-use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
+use iceberg::{Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
 
-use crate::catalog_access::CatalogAccess;
+use crate::catalog_access::IcebergCatalogAccess;
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
 use crate::physical_plan::project::project_with_partition;
@@ -68,7 +68,7 @@ use crate::physical_plan::write::IcebergWriteExec;
 #[derive(Debug, Clone)]
 pub struct IcebergTableProvider {
     /// The catalog that manages this table
-    catalog: CatalogAccess,
+    catalog: IcebergCatalogAccess,
     /// The table identifier (namespace + name)
     table_ident: TableIdent,
     /// A reference-counted arrow `Schema` (cached at construction)
@@ -81,7 +81,7 @@ impl IcebergTableProvider {
     /// Loads the table once to get the initial schema, then stores the catalog
     /// reference for future metadata refreshes on each operation.
     pub(crate) async fn try_new(
-        catalog: impl Into<CatalogAccess>,
+        catalog: impl Into<IcebergCatalogAccess>,
         namespace: NamespaceIdent,
         name: impl Into<String>,
     ) -> Result<Self> {

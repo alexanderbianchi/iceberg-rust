@@ -18,10 +18,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, SchemaProvider};
 use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent, Result};
 
+use crate::catalog_access::IcebergCatalogAccess;
 use crate::schema::IcebergSchemaProvider;
 
 /// Provides an interface to manage and access multiple schemas
@@ -31,10 +32,20 @@ use crate::schema::IcebergSchemaProvider;
 /// multiple [`SchemaProvider`], each associated with distinct namespaces.
 #[derive(Debug)]
 pub struct IcebergCatalogProvider {
-    /// A `HashMap` where keys are namespace names
-    /// and values are dynamic references to objects implementing the
-    /// [`SchemaProvider`] trait.
-    schemas: HashMap<String, Arc<dyn SchemaProvider>>,
+    inner: IcebergCatalogProviderInner,
+}
+
+#[derive(Debug)]
+enum IcebergCatalogProviderInner {
+    Plain {
+        schemas: HashMap<String, Arc<dyn SchemaProvider>>,
+    },
+    ResolvedSession {
+        // Retain the immutable session binding for the lifetime of this
+        // query-scoped provider. Its table providers hold clones.
+        _access: IcebergCatalogAccess,
+        resolved: MemoryCatalogProvider,
+    },
 }
 
 impl IcebergCatalogProvider {
@@ -78,16 +89,38 @@ impl IcebergCatalogProvider {
             })
             .collect();
 
-        Ok(IcebergCatalogProvider { schemas })
+        Ok(IcebergCatalogProvider {
+            inner: IcebergCatalogProviderInner::Plain { schemas },
+        })
+    }
+
+    pub(crate) fn resolved_session(
+        access: IcebergCatalogAccess,
+        resolved: MemoryCatalogProvider,
+    ) -> Self {
+        Self {
+            inner: IcebergCatalogProviderInner::ResolvedSession {
+                _access: access,
+                resolved,
+            },
+        }
     }
 }
 
 impl CatalogProvider for IcebergCatalogProvider {
     fn schema_names(&self) -> Vec<String> {
-        self.schemas.keys().cloned().collect()
+        match &self.inner {
+            IcebergCatalogProviderInner::Plain { schemas } => schemas.keys().cloned().collect(),
+            IcebergCatalogProviderInner::ResolvedSession { resolved, .. } => {
+                resolved.schema_names()
+            }
+        }
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.schemas.get(name).cloned()
+        match &self.inner {
+            IcebergCatalogProviderInner::Plain { schemas } => schemas.get(name).cloned(),
+            IcebergCatalogProviderInner::ResolvedSession { resolved, .. } => resolved.schema(name),
+        }
     }
 }

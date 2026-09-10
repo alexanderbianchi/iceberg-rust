@@ -81,7 +81,9 @@ use crate::transaction::update_properties::UpdatePropertiesAction;
 use crate::transaction::update_schema::UpdateSchemaAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
-use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
+use crate::{
+    Catalog, SessionCatalog, SessionContext, TableCommit, TableIdent, TableRequirement, TableUpdate,
+};
 
 /// Table transaction.
 #[derive(Clone)]
@@ -171,8 +173,22 @@ impl Transaction {
         ExpireSnapshotsAction::new()
     }
 
-    /// Commit transaction.
+    /// Commits this transaction through a [`Catalog`].
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
+        self.commit_inner(TransactionCatalog::Plain(catalog)).await
+    }
+
+    /// Commits this transaction through a [`SessionCatalog`] using `context`.
+    pub async fn commit_with_session(
+        self,
+        catalog: &dyn SessionCatalog,
+        context: &SessionContext,
+    ) -> Result<Table> {
+        self.commit_inner(TransactionCatalog::Session { catalog, context })
+            .await
+    }
+
+    async fn commit_inner(self, catalog: TransactionCatalog<'_>) -> Result<Table> {
         if self.actions.is_empty() {
             // nothing to commit
             return Ok(self.table);
@@ -207,7 +223,7 @@ impl Transaction {
             .build())
     }
 
-    async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
+    async fn do_commit(&mut self, catalog: TransactionCatalog<'_>) -> Result<Table> {
         let refreshed = catalog.load_table(self.table.identifier()).await?;
 
         if self.table.metadata() != refreshed.metadata()
@@ -239,6 +255,31 @@ impl Transaction {
             .build();
 
         catalog.update_table(table_commit).await
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TransactionCatalog<'a> {
+    Plain(&'a dyn Catalog),
+    Session {
+        catalog: &'a dyn SessionCatalog,
+        context: &'a SessionContext,
+    },
+}
+
+impl TransactionCatalog<'_> {
+    async fn load_table(&self, ident: &TableIdent) -> Result<Table> {
+        match self {
+            Self::Plain(catalog) => catalog.load_table(ident).await,
+            Self::Session { catalog, context } => catalog.load_table(context, ident).await,
+        }
+    }
+
+    async fn update_table(&self, commit: TableCommit) -> Result<Table> {
+        match self {
+            Self::Plain(catalog) => catalog.update_table(commit).await,
+            Self::Session { catalog, context } => catalog.update_table(context, commit).await,
+        }
     }
 }
 

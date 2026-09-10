@@ -19,14 +19,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::catalog::{AsyncCatalogProvider, CatalogProvider, SchemaProvider};
+use datafusion::catalog::{
+    AsyncCatalogProvider, CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider,
+    SchemaProvider,
+};
 use datafusion::common::{DataFusionError, Result as DFResult, TableReference, not_impl_err};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::config::SessionConfig;
 use iceberg::inspect::MetadataTableType;
 use iceberg::{NamespaceIdent, SessionCatalog, SessionContext};
 
-use crate::catalog_access::CatalogAccess;
+use crate::catalog::IcebergCatalogProvider;
+use crate::catalog_access::IcebergCatalogAccess;
 use crate::table::IcebergTableProvider;
 use crate::to_datafusion_error;
 
@@ -82,86 +86,38 @@ impl AsyncCatalogProvider for IcebergSessionCatalogProvider {
         }
 
         if requested.is_empty() {
-            return Ok(Arc::new(ResolvedIcebergCatalogProvider::default()));
+            return Ok(Arc::new(MemoryCatalogProvider::new()));
         }
         let context = config.get_extension::<SessionContext>().ok_or_else(|| {
             DataFusionError::Configuration(
                 "Iceberg SessionContext is required to resolve a session catalog".to_string(),
             )
         })?;
-        let access = CatalogAccess::Session {
+        let access = IcebergCatalogAccess::Session {
             catalog: Arc::clone(&self.catalog),
             context,
         };
-        let mut schemas = HashMap::new();
+        let resolved = MemoryCatalogProvider::new();
         for (schema_name, table_names) in requested {
             let namespace =
                 NamespaceIdent::from_strs([&schema_name]).map_err(to_datafusion_error)?;
-            let mut tables = HashMap::new();
+            let schema = Arc::new(MemorySchemaProvider::new());
             for table_name in table_names {
                 let provider =
                     load_table_provider(access.clone(), namespace.clone(), &table_name).await?;
-                tables.insert(table_name, provider);
+                schema.register_table(table_name, provider)?;
             }
-            schemas.insert(
-                schema_name,
-                Arc::new(ResolvedIcebergSchemaProvider { tables }) as Arc<dyn SchemaProvider>,
-            );
+            resolved.register_schema(&schema_name, schema)?;
         }
 
-        Ok(Arc::new(ResolvedIcebergCatalogProvider { schemas }))
-    }
-}
-
-#[derive(Debug, Default)]
-struct ResolvedIcebergCatalogProvider {
-    schemas: HashMap<String, Arc<dyn SchemaProvider>>,
-}
-
-impl CatalogProvider for ResolvedIcebergCatalogProvider {
-    fn schema_names(&self) -> Vec<String> {
-        self.schemas.keys().cloned().collect()
-    }
-
-    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.schemas.get(name).cloned()
-    }
-}
-
-#[derive(Debug)]
-struct ResolvedIcebergSchemaProvider {
-    tables: HashMap<String, Arc<dyn TableProvider>>,
-}
-
-#[async_trait]
-impl SchemaProvider for ResolvedIcebergSchemaProvider {
-    fn table_names(&self) -> Vec<String> {
-        self.tables.keys().cloned().collect()
-    }
-
-    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        Ok(self.tables.get(name).cloned())
-    }
-
-    fn register_table(
-        &self,
-        _name: String,
-        _table: Arc<dyn TableProvider>,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        not_impl_err!("query-resolved Iceberg schemas do not support registration")
-    }
-
-    fn deregister_table(&self, _name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        not_impl_err!("query-resolved Iceberg schemas do not support deregistration")
-    }
-
-    fn table_exist(&self, name: &str) -> bool {
-        self.tables.contains_key(name)
+        Ok(Arc::new(IcebergCatalogProvider::resolved_session(
+            access, resolved,
+        )))
     }
 }
 
 async fn load_table_provider(
-    access: CatalogAccess,
+    access: IcebergCatalogAccess,
     namespace: NamespaceIdent,
     name: &str,
 ) -> DFResult<Arc<dyn TableProvider>> {

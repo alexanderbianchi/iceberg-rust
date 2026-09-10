@@ -18,18 +18,16 @@
 use std::sync::Arc;
 
 use iceberg::table::Table;
-use iceberg::{
-    Catalog, NamespaceIdent, Result, SessionCatalog, SessionContext, TableCommit, TableCreation,
-    TableIdent,
-};
+use iceberg::transaction::Transaction;
+use iceberg::{Catalog, Result, SessionCatalog, SessionContext, TableIdent};
 
-/// Access to an Iceberg catalog, with an optional immutable session context.
+/// Iceberg catalog access retained by a DataFusion table provider.
 ///
-/// This preserves the existing plain [`Catalog`] API while allowing providers
-/// produced by [`crate::IcebergSessionCatalogProvider`] to retain the exact
-/// [`SessionContext`] supplied by a DataFusion query.
+/// Unlike a catalog adapter, this type does not implement [`Catalog`]. Each
+/// operation dispatches directly to the API selected when the provider was
+/// constructed.
 #[derive(Clone, Debug)]
-pub(crate) enum CatalogAccess {
+pub(crate) enum IcebergCatalogAccess {
     Plain(Arc<dyn Catalog>),
     Session {
         catalog: Arc<dyn SessionCatalog>,
@@ -37,153 +35,42 @@ pub(crate) enum CatalogAccess {
     },
 }
 
-impl From<Arc<dyn Catalog>> for CatalogAccess {
-    fn from(catalog: Arc<dyn Catalog>) -> Self {
-        Self::Plain(catalog)
+impl IcebergCatalogAccess {
+    pub(crate) async fn load_table(&self, ident: &TableIdent) -> Result<Table> {
+        match self {
+            Self::Plain(catalog) => catalog.load_table(ident).await,
+            Self::Session { catalog, context } => catalog.load_table(context, ident).await,
+        }
+    }
+
+    pub(crate) async fn commit(&self, transaction: Transaction) -> Result<Table> {
+        match self {
+            Self::Plain(catalog) => transaction.commit(catalog.as_ref()).await,
+            Self::Session { catalog, context } => {
+                transaction
+                    .commit_with_session(catalog.as_ref(), context)
+                    .await
+            }
+        }
     }
 }
 
-impl<T: Catalog + 'static> From<Arc<T>> for CatalogAccess {
+impl<T> From<Arc<T>> for IcebergCatalogAccess
+where T: Catalog + 'static
+{
     fn from(catalog: Arc<T>) -> Self {
         Self::Plain(catalog)
     }
 }
 
-#[async_trait::async_trait]
-impl Catalog for CatalogAccess {
-    async fn list_namespaces(
-        &self,
-        parent: Option<&NamespaceIdent>,
-    ) -> Result<Vec<NamespaceIdent>> {
-        match self {
-            Self::Plain(catalog) => catalog.list_namespaces(parent).await,
-            Self::Session { catalog, context } => catalog.list_namespaces(context, parent).await,
-        }
+impl From<Arc<dyn Catalog>> for IcebergCatalogAccess {
+    fn from(catalog: Arc<dyn Catalog>) -> Self {
+        Self::Plain(catalog)
     }
+}
 
-    async fn create_namespace(
-        &self,
-        namespace: &NamespaceIdent,
-        properties: std::collections::HashMap<String, String>,
-    ) -> Result<iceberg::Namespace> {
-        match self {
-            Self::Plain(catalog) => catalog.create_namespace(namespace, properties).await,
-            Self::Session { catalog, context } => {
-                catalog
-                    .create_namespace(context, namespace, properties)
-                    .await
-            }
-        }
-    }
-
-    async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<iceberg::Namespace> {
-        match self {
-            Self::Plain(catalog) => catalog.get_namespace(namespace).await,
-            Self::Session { catalog, context } => catalog.get_namespace(context, namespace).await,
-        }
-    }
-
-    async fn namespace_exists(&self, namespace: &NamespaceIdent) -> Result<bool> {
-        match self {
-            Self::Plain(catalog) => catalog.namespace_exists(namespace).await,
-            Self::Session { catalog, context } => {
-                catalog.namespace_exists(context, namespace).await
-            }
-        }
-    }
-
-    async fn update_namespace(
-        &self,
-        namespace: &NamespaceIdent,
-        properties: std::collections::HashMap<String, String>,
-    ) -> Result<()> {
-        match self {
-            Self::Plain(catalog) => catalog.update_namespace(namespace, properties).await,
-            Self::Session { catalog, context } => {
-                catalog
-                    .update_namespace(context, namespace, properties)
-                    .await
-            }
-        }
-    }
-
-    async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()> {
-        match self {
-            Self::Plain(catalog) => catalog.drop_namespace(namespace).await,
-            Self::Session { catalog, context } => catalog.drop_namespace(context, namespace).await,
-        }
-    }
-
-    async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
-        match self {
-            Self::Plain(catalog) => catalog.list_tables(namespace).await,
-            Self::Session { catalog, context } => catalog.list_tables(context, namespace).await,
-        }
-    }
-
-    async fn create_table(
-        &self,
-        namespace: &NamespaceIdent,
-        creation: TableCreation,
-    ) -> Result<Table> {
-        match self {
-            Self::Plain(catalog) => catalog.create_table(namespace, creation).await,
-            Self::Session { catalog, context } => {
-                catalog.create_table(context, namespace, creation).await
-            }
-        }
-    }
-
-    async fn load_table(&self, table: &TableIdent) -> Result<Table> {
-        match self {
-            Self::Plain(catalog) => catalog.load_table(table).await,
-            Self::Session { catalog, context } => catalog.load_table(context, table).await,
-        }
-    }
-
-    async fn drop_table(&self, table: &TableIdent) -> Result<()> {
-        match self {
-            Self::Plain(catalog) => catalog.drop_table(table).await,
-            Self::Session { catalog, context } => catalog.drop_table(context, table).await,
-        }
-    }
-
-    async fn purge_table(&self, table: &TableIdent) -> Result<()> {
-        match self {
-            Self::Plain(catalog) => catalog.purge_table(table).await,
-            Self::Session { catalog, context } => catalog.purge_table(context, table).await,
-        }
-    }
-
-    async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
-        match self {
-            Self::Plain(catalog) => catalog.table_exists(table).await,
-            Self::Session { catalog, context } => catalog.table_exists(context, table).await,
-        }
-    }
-
-    async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {
-        match self {
-            Self::Plain(catalog) => catalog.rename_table(src, dest).await,
-            Self::Session { catalog, context } => catalog.rename_table(context, src, dest).await,
-        }
-    }
-
-    async fn register_table(&self, table: &TableIdent, metadata_location: String) -> Result<Table> {
-        match self {
-            Self::Plain(catalog) => catalog.register_table(table, metadata_location).await,
-            Self::Session { catalog, context } => {
-                catalog
-                    .register_table(context, table, metadata_location)
-                    .await
-            }
-        }
-    }
-
-    async fn update_table(&self, commit: TableCommit) -> Result<Table> {
-        match self {
-            Self::Plain(catalog) => catalog.update_table(commit).await,
-            Self::Session { catalog, context } => catalog.update_table(context, commit).await,
-        }
+impl From<(Arc<dyn SessionCatalog>, Arc<SessionContext>)> for IcebergCatalogAccess {
+    fn from((catalog, context): (Arc<dyn SessionCatalog>, Arc<SessionContext>)) -> Self {
+        Self::Session { catalog, context }
     }
 }

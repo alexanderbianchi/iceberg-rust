@@ -33,7 +33,7 @@ use iceberg::spec::{DataFile, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
-use crate::catalog_access::CatalogAccess;
+use crate::catalog_access::IcebergCatalogAccess;
 use crate::physical_plan::DATA_FILES_COL_NAME;
 use crate::to_datafusion_error;
 
@@ -42,7 +42,7 @@ use crate::to_datafusion_error;
 #[derive(Debug)]
 pub(crate) struct IcebergCommitExec {
     table: Table,
-    catalog: CatalogAccess,
+    catalog: IcebergCatalogAccess,
     input: Arc<dyn ExecutionPlan>,
     schema: ArrowSchemaRef,
     count_schema: ArrowSchemaRef,
@@ -52,7 +52,7 @@ pub(crate) struct IcebergCommitExec {
 impl IcebergCommitExec {
     pub fn new(
         table: Table,
-        catalog: impl Into<CatalogAccess>,
+        catalog: impl Into<IcebergCatalogAccess>,
         input: Arc<dyn ExecutionPlan>,
         schema: ArrowSchemaRef,
     ) -> Self {
@@ -245,10 +245,9 @@ impl ExecutionPlan for IcebergCommitExec {
             let action = tx.fast_append().add_data_files(data_files);
 
             // Apply the action and commit the transaction
-            let _updated_table = action
-                .apply(tx)
-                .map_err(to_datafusion_error)?
-                .commit(&catalog)
+            let transaction = action.apply(tx).map_err(to_datafusion_error)?;
+            let _updated_table = catalog
+                .commit(transaction)
                 .await
                 .map_err(to_datafusion_error)?;
 
