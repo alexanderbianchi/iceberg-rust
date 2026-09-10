@@ -59,22 +59,30 @@ use crate::physical_plan::scan::IcebergTableScan;
 use crate::physical_plan::sort::sort_by_partition;
 use crate::physical_plan::write::IcebergWriteExec;
 
-/// Catalog-backed table provider with automatic metadata refresh.
+/// Catalog-backed table provider.
 ///
-/// This provider loads fresh table metadata from the catalog on every scan and write
-/// operation, ensuring you always see the latest table state. Use this when you need
-/// write operations or want to see the most up-to-date data.
+/// Providers registered through [`crate::IcebergCatalogProvider`] refresh table
+/// metadata on every scan and write. Providers produced by
+/// [`crate::IcebergSessionCatalogProvider`] are query-scoped and reuse the table
+/// loaded during async resolution. Both modes refresh again when committing a
+/// transaction to handle concurrent updates and retries.
 ///
 /// For read-only access to a specific snapshot without catalog overhead, use
 /// [`IcebergStaticTableProvider`] instead.
 #[derive(Debug, Clone)]
 pub struct IcebergTableProvider {
-    /// The catalog that manages this table
+    /// The catalog that manages this table.
     catalog: IcebergCatalogAccess,
-    /// The table identifier (namespace + name)
-    table_ident: TableIdent,
-    /// A reference-counted arrow `Schema` (cached at construction)
+    /// How table metadata is obtained while planning operations.
+    metadata: TableMetadata,
+    /// A reference-counted arrow `Schema` (cached at construction).
     schema: ArrowSchemaRef,
+}
+
+#[derive(Debug, Clone)]
+enum TableMetadata {
+    Refreshing { table_ident: TableIdent },
+    Resolved { table: Table },
 }
 
 impl IcebergTableProvider {
@@ -87,7 +95,11 @@ impl IcebergTableProvider {
         namespace: NamespaceIdent,
         name: impl Into<String>,
     ) -> Result<Self> {
-        Self::try_new_with_access(IcebergCatalogAccess::plain(catalog), namespace, name).await
+        let catalog = IcebergCatalogAccess::plain(catalog);
+        let table_ident = TableIdent::new(namespace, name.into());
+        let table = catalog.load_table(&table_ident).await?;
+
+        Self::from_table(catalog, TableMetadata::Refreshing { table_ident }, &table)
     }
 
     pub(crate) async fn try_new_session(
@@ -96,38 +108,44 @@ impl IcebergTableProvider {
         namespace: NamespaceIdent,
         name: impl Into<String>,
     ) -> Result<Self> {
-        Self::try_new_with_access(
-            IcebergCatalogAccess::session(catalog, context),
-            namespace,
-            name,
+        let catalog = IcebergCatalogAccess::session(catalog, context);
+        let table_ident = TableIdent::new(namespace, name.into());
+        let table = catalog.load_table(&table_ident).await?;
+
+        Self::from_table(
+            catalog,
+            TableMetadata::Resolved {
+                table: table.clone(),
+            },
+            &table,
         )
-        .await
     }
 
-    async fn try_new_with_access(
+    fn from_table(
         catalog: IcebergCatalogAccess,
-        namespace: NamespaceIdent,
-        name: impl Into<String>,
+        metadata: TableMetadata,
+        table: &Table,
     ) -> Result<Self> {
-        let table_ident = TableIdent::new(namespace, name.into());
-
-        // Load table once to get initial schema
-        let table = catalog.load_table(&table_ident).await?;
         let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
-
-        Ok(IcebergTableProvider {
+        Ok(Self {
             catalog,
-            table_ident,
+            metadata,
             schema,
         })
+    }
+
+    async fn table_for_planning(&self) -> Result<Table> {
+        match &self.metadata {
+            TableMetadata::Refreshing { table_ident } => self.catalog.load_table(table_ident).await,
+            TableMetadata::Resolved { table } => Ok(table.clone()),
+        }
     }
 
     pub(crate) async fn metadata_table(
         &self,
         r#type: MetadataTableType,
     ) -> Result<IcebergMetadataTableProvider> {
-        // Load fresh table metadata for metadata table access
-        let table = self.catalog.load_table(&self.table_ident).await?;
+        let table = self.table_for_planning().await?;
         Ok(IcebergMetadataTableProvider { table, r#type })
     }
 }
@@ -149,14 +167,11 @@ impl TableProvider for IcebergTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Load fresh table metadata from catalog
         let table = self
-            .catalog
-            .load_table(&self.table_ident)
+            .table_for_planning()
             .await
             .map_err(to_datafusion_error)?;
 
-        // Create scan with fresh metadata (always use current snapshot)
         Ok(Arc::new(IcebergTableScan::new(
             table,
             None, // Always use current snapshot for catalog-backed provider
@@ -187,10 +202,8 @@ impl TableProvider for IcebergTableProvider {
             )));
         }
 
-        // Load fresh table metadata from catalog
         let table = self
-            .catalog
-            .load_table(&self.table_ident)
+            .table_for_planning()
             .await
             .map_err(to_datafusion_error)?;
 

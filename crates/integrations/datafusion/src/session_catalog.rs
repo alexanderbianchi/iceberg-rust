@@ -212,6 +212,16 @@ mod tests {
             .collect()
             .await
             .unwrap();
+        assert_eq!(
+            catalog
+                .calls()
+                .iter()
+                .filter(|call| call.operation == "load_table")
+                .count(),
+            1,
+            "scan should reuse the table loaded during resolution",
+        );
+
         session
             .sql("INSERT INTO iceberg.test_ns.test_table VALUES (1, 'test')")
             .await
@@ -222,7 +232,21 @@ mod tests {
 
         let calls = catalog.calls();
         assert_eq!(calls.first().unwrap().operation, "load_table");
-        assert!(calls.iter().any(|call| call.operation == "update_table"));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.operation == "load_table")
+                .count(),
+            2,
+            "insert planning should reuse the resolved table; commit should refresh it once",
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.operation == "update_table")
+                .count(),
+            1,
+        );
         assert!(!calls.iter().any(|call| {
             call.operation == "list_namespaces" || call.operation == "list_tables"
         }));
@@ -232,6 +256,36 @@ mod tests {
                 && call.properties == *context.properties()
                 && call.credentials == *context.credentials()
         }));
+    }
+
+    #[tokio::test]
+    async fn metadata_table_reuses_table_loaded_during_resolution() {
+        let (catalog, _namespace, _table, _temp_dir) = test_utils::create_recording_catalog().await;
+        let resolver = IcebergSessionCatalogProvider::new(catalog.clone());
+        let context = Arc::new(SessionContext::builder().build());
+        let config = SessionConfig::new().with_extension(context);
+
+        resolver
+            .resolve(
+                &[TableReference::full(
+                    "iceberg",
+                    "test_ns",
+                    "test_table$snapshots",
+                )],
+                &config,
+                "iceberg",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            catalog
+                .calls()
+                .iter()
+                .filter(|call| call.operation == "load_table")
+                .count(),
+            1,
+        );
     }
 
     #[tokio::test]
