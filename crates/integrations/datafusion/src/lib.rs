@@ -23,8 +23,13 @@ pub use error::*;
 
 pub mod physical_plan;
 mod schema;
+mod session_catalog;
+pub use session_catalog::*;
 pub mod table;
 pub use table::table_provider_factory::IcebergTableProviderFactory;
 pub use table::*;
 
 pub(crate) mod task_writer;
+
+#[cfg(test)]
+mod test_utils;

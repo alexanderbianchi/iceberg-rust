@@ -29,12 +29,12 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
-use iceberg::Catalog;
 use iceberg::spec::{DataFile, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
 use crate::physical_plan::DATA_FILES_COL_NAME;
+use crate::table::IcebergTableSource;
 use crate::to_datafusion_error;
 
 /// IcebergCommitExec is responsible for collecting the files written and use
@@ -42,7 +42,7 @@ use crate::to_datafusion_error;
 #[derive(Debug)]
 pub(crate) struct IcebergCommitExec {
     table: Table,
-    catalog: Arc<dyn Catalog>,
+    source: IcebergTableSource,
     input: Arc<dyn ExecutionPlan>,
     schema: ArrowSchemaRef,
     count_schema: ArrowSchemaRef,
@@ -50,9 +50,9 @@ pub(crate) struct IcebergCommitExec {
 }
 
 impl IcebergCommitExec {
-    pub fn new(
+    pub(crate) fn new(
         table: Table,
-        catalog: Arc<dyn Catalog>,
+        source: IcebergTableSource,
         input: Arc<dyn ExecutionPlan>,
         schema: ArrowSchemaRef,
     ) -> Self {
@@ -62,7 +62,7 @@ impl IcebergCommitExec {
 
         Self {
             table,
-            catalog,
+            source,
             input,
             schema,
             count_schema,
@@ -157,7 +157,7 @@ impl ExecutionPlan for IcebergCommitExec {
 
         Ok(Arc::new(IcebergCommitExec::new(
             self.table.clone(),
-            self.catalog.clone(),
+            self.source.clone(),
             children[0].clone(),
             self.schema.clone(),
         )))
@@ -183,7 +183,7 @@ impl ExecutionPlan for IcebergCommitExec {
         let partition_type = self.table.metadata().default_partition_type().clone();
         let current_schema = self.table.metadata().current_schema().clone();
 
-        let catalog = Arc::clone(&self.catalog);
+        let source = self.source.clone();
 
         // Process the input streams from all partitions and commit the data files
         let stream = futures::stream::once(async move {
@@ -244,10 +244,9 @@ impl ExecutionPlan for IcebergCommitExec {
             let action = tx.fast_append().add_data_files(data_files);
 
             // Apply the action and commit the transaction
-            let _updated_table = action
-                .apply(tx)
-                .map_err(to_datafusion_error)?
-                .commit(catalog.as_ref())
+            let transaction = action.apply(tx).map_err(to_datafusion_error)?;
+            let _updated_table = source
+                .commit(transaction)
                 .await
                 .map_err(to_datafusion_error)?;
 
@@ -460,8 +459,12 @@ mod tests {
             false,
         )]));
 
-        let commit_exec =
-            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec, arrow_schema);
+        let commit_exec = IcebergCommitExec::new(
+            table.clone(),
+            IcebergTableSource::refreshing(catalog.clone(), table.identifier().clone()),
+            input_exec,
+            arrow_schema,
+        );
 
         // Verify Execution Plan schema matches the count schema
         assert_eq!(commit_exec.schema(), IcebergCommitExec::make_count_schema());
@@ -563,8 +566,12 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
-        let commit_exec =
-            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec, arrow_schema);
+        let commit_exec = IcebergCommitExec::new(
+            table.clone(),
+            IcebergTableSource::refreshing(catalog.clone(), table.identifier().clone()),
+            input_exec,
+            arrow_schema,
+        );
 
         let task_ctx = Arc::new(TaskContext::default());
         let stream = commit_exec.execute(0, task_ctx)?;
