@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,8 +29,6 @@ use datafusion::execution::config::SessionConfig;
 use iceberg::inspect::MetadataTableType;
 use iceberg::{NamespaceIdent, SessionCatalog, SessionContext};
 
-use crate::catalog::IcebergCatalogProvider;
-use crate::catalog_access::IcebergCatalogAccess;
 use crate::table::IcebergTableProvider;
 use crate::to_datafusion_error;
 
@@ -68,7 +66,7 @@ impl AsyncCatalogProvider for IcebergSessionCatalogProvider {
         config: &SessionConfig,
         catalog_name: &str,
     ) -> DFResult<Arc<dyn CatalogProvider>> {
-        let mut requested = HashMap::<String, Vec<String>>::new();
+        let mut requested = HashMap::<String, HashSet<String>>::new();
         for reference in references {
             let reference_catalog = reference
                 .catalog()
@@ -79,10 +77,10 @@ impl AsyncCatalogProvider for IcebergSessionCatalogProvider {
             let schema = reference
                 .schema()
                 .unwrap_or(&config.options().catalog.default_schema);
-            let tables = requested.entry(schema.to_string()).or_default();
-            if !tables.iter().any(|table| table == reference.table()) {
-                tables.push(reference.table().to_string());
-            }
+            requested
+                .entry(schema.to_string())
+                .or_default()
+                .insert(reference.table().to_string());
         }
 
         if requested.is_empty() {
@@ -93,31 +91,31 @@ impl AsyncCatalogProvider for IcebergSessionCatalogProvider {
                 "Iceberg SessionContext is required to resolve a session catalog".to_string(),
             )
         })?;
-        let access = IcebergCatalogAccess::Session {
-            catalog: Arc::clone(&self.catalog),
-            context,
-        };
         let resolved = MemoryCatalogProvider::new();
         for (schema_name, table_names) in requested {
             let namespace =
                 NamespaceIdent::from_strs([&schema_name]).map_err(to_datafusion_error)?;
             let schema = Arc::new(MemorySchemaProvider::new());
             for table_name in table_names {
-                let provider =
-                    load_table_provider(access.clone(), namespace.clone(), &table_name).await?;
+                let provider = load_table_provider(
+                    Arc::clone(&self.catalog),
+                    Arc::clone(&context),
+                    namespace.clone(),
+                    &table_name,
+                )
+                .await?;
                 schema.register_table(table_name, provider)?;
             }
             resolved.register_schema(&schema_name, schema)?;
         }
 
-        Ok(Arc::new(IcebergCatalogProvider::resolved_session(
-            access, resolved,
-        )))
+        Ok(Arc::new(resolved))
     }
 }
 
 async fn load_table_provider(
-    access: IcebergCatalogAccess,
+    catalog: Arc<dyn SessionCatalog>,
+    context: Arc<SessionContext>,
     namespace: NamespaceIdent,
     name: &str,
 ) -> DFResult<Arc<dyn TableProvider>> {
@@ -128,7 +126,7 @@ async fn load_table_provider(
         ),
         None => (name, None),
     };
-    let table = IcebergTableProvider::try_new(access, namespace, table_name)
+    let table = IcebergTableProvider::try_new_session(catalog, context, namespace, table_name)
         .await
         .map_err(to_datafusion_error)?;
 

@@ -50,13 +50,12 @@ pub(crate) struct IcebergCommitExec {
 }
 
 impl IcebergCommitExec {
-    pub fn new(
+    pub(crate) fn new(
         table: Table,
-        catalog: impl Into<IcebergCatalogAccess>,
+        catalog: IcebergCatalogAccess,
         input: Arc<dyn ExecutionPlan>,
         schema: ArrowSchemaRef,
     ) -> Self {
-        let catalog = catalog.into();
         let count_schema = Self::make_count_schema();
 
         let plan_properties = Self::compute_properties(Arc::clone(&count_schema));
@@ -460,8 +459,12 @@ mod tests {
             false,
         )]));
 
-        let commit_exec =
-            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec, arrow_schema);
+        let commit_exec = IcebergCommitExec::new(
+            table.clone(),
+            IcebergCatalogAccess::plain(catalog.clone()),
+            input_exec,
+            arrow_schema,
+        );
 
         // Verify Execution Plan schema matches the count schema
         assert_eq!(commit_exec.schema(), IcebergCommitExec::make_count_schema());
@@ -563,8 +566,12 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
-        let commit_exec =
-            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec, arrow_schema);
+        let commit_exec = IcebergCommitExec::new(
+            table.clone(),
+            IcebergCatalogAccess::plain(catalog.clone()),
+            input_exec,
+            arrow_schema,
+        );
 
         let task_ctx = Arc::new(TaskContext::default());
         let stream = commit_exec.execute(0, task_ctx)?;

@@ -36,6 +36,14 @@ pub(crate) enum IcebergCatalogAccess {
 }
 
 impl IcebergCatalogAccess {
+    pub(crate) fn plain(catalog: Arc<dyn Catalog>) -> Self {
+        Self::Plain(catalog)
+    }
+
+    pub(crate) fn session(catalog: Arc<dyn SessionCatalog>, context: Arc<SessionContext>) -> Self {
+        Self::Session { catalog, context }
+    }
+
     pub(crate) async fn load_table(&self, ident: &TableIdent) -> Result<Table> {
         match self {
             Self::Plain(catalog) => catalog.load_table(ident).await,
@@ -52,25 +60,5 @@ impl IcebergCatalogAccess {
                     .await
             }
         }
-    }
-}
-
-impl<T> From<Arc<T>> for IcebergCatalogAccess
-where T: Catalog + 'static
-{
-    fn from(catalog: Arc<T>) -> Self {
-        Self::Plain(catalog)
-    }
-}
-
-impl From<Arc<dyn Catalog>> for IcebergCatalogAccess {
-    fn from(catalog: Arc<dyn Catalog>) -> Self {
-        Self::Plain(catalog)
-    }
-}
-
-impl From<(Arc<dyn SessionCatalog>, Arc<SessionContext>)> for IcebergCatalogAccess {
-    fn from((catalog, context): (Arc<dyn SessionCatalog>, Arc<SessionContext>)) -> Self {
-        Self::Session { catalog, context }
     }
 }

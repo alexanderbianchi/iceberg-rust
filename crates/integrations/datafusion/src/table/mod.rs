@@ -45,7 +45,9 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::table::Table;
-use iceberg::{Error, ErrorKind, NamespaceIdent, Result, TableIdent};
+use iceberg::{
+    Catalog, Error, ErrorKind, NamespaceIdent, Result, SessionCatalog, SessionContext, TableIdent,
+};
 use metadata_table::IcebergMetadataTableProvider;
 
 use crate::catalog_access::IcebergCatalogAccess;
@@ -81,11 +83,32 @@ impl IcebergTableProvider {
     /// Loads the table once to get the initial schema, then stores the catalog
     /// reference for future metadata refreshes on each operation.
     pub(crate) async fn try_new(
-        catalog: impl Into<IcebergCatalogAccess>,
+        catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         name: impl Into<String>,
     ) -> Result<Self> {
-        let catalog = catalog.into();
+        Self::try_new_with_access(IcebergCatalogAccess::plain(catalog), namespace, name).await
+    }
+
+    pub(crate) async fn try_new_session(
+        catalog: Arc<dyn SessionCatalog>,
+        context: Arc<SessionContext>,
+        namespace: NamespaceIdent,
+        name: impl Into<String>,
+    ) -> Result<Self> {
+        Self::try_new_with_access(
+            IcebergCatalogAccess::session(catalog, context),
+            namespace,
+            name,
+        )
+        .await
+    }
+
+    async fn try_new_with_access(
+        catalog: IcebergCatalogAccess,
+        namespace: NamespaceIdent,
+        name: impl Into<String>,
+    ) -> Result<Self> {
         let table_ident = TableIdent::new(namespace, name.into());
 
         // Load table once to get initial schema
