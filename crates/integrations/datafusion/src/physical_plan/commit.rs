@@ -33,8 +33,8 @@ use iceberg::spec::{DataFile, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
-use crate::catalog_access::IcebergCatalogAccess;
 use crate::physical_plan::DATA_FILES_COL_NAME;
+use crate::table::IcebergTableSource;
 use crate::to_datafusion_error;
 
 /// IcebergCommitExec is responsible for collecting the files written and use
@@ -42,7 +42,7 @@ use crate::to_datafusion_error;
 #[derive(Debug)]
 pub(crate) struct IcebergCommitExec {
     table: Table,
-    catalog: IcebergCatalogAccess,
+    source: IcebergTableSource,
     input: Arc<dyn ExecutionPlan>,
     schema: ArrowSchemaRef,
     count_schema: ArrowSchemaRef,
@@ -52,7 +52,7 @@ pub(crate) struct IcebergCommitExec {
 impl IcebergCommitExec {
     pub(crate) fn new(
         table: Table,
-        catalog: IcebergCatalogAccess,
+        source: IcebergTableSource,
         input: Arc<dyn ExecutionPlan>,
         schema: ArrowSchemaRef,
     ) -> Self {
@@ -62,7 +62,7 @@ impl IcebergCommitExec {
 
         Self {
             table,
-            catalog,
+            source,
             input,
             schema,
             count_schema,
@@ -157,7 +157,7 @@ impl ExecutionPlan for IcebergCommitExec {
 
         Ok(Arc::new(IcebergCommitExec::new(
             self.table.clone(),
-            self.catalog.clone(),
+            self.source.clone(),
             children[0].clone(),
             self.schema.clone(),
         )))
@@ -183,7 +183,7 @@ impl ExecutionPlan for IcebergCommitExec {
         let partition_type = self.table.metadata().default_partition_type().clone();
         let current_schema = self.table.metadata().current_schema().clone();
 
-        let catalog = self.catalog.clone();
+        let source = self.source.clone();
 
         // Process the input streams from all partitions and commit the data files
         let stream = futures::stream::once(async move {
@@ -245,7 +245,7 @@ impl ExecutionPlan for IcebergCommitExec {
 
             // Apply the action and commit the transaction
             let transaction = action.apply(tx).map_err(to_datafusion_error)?;
-            let _updated_table = catalog
+            let _updated_table = source
                 .commit(transaction)
                 .await
                 .map_err(to_datafusion_error)?;
@@ -461,7 +461,7 @@ mod tests {
 
         let commit_exec = IcebergCommitExec::new(
             table.clone(),
-            IcebergCatalogAccess::plain(catalog.clone()),
+            IcebergTableSource::refreshing(catalog.clone(), table.identifier().clone()),
             input_exec,
             arrow_schema,
         );
@@ -568,7 +568,7 @@ mod tests {
         )]));
         let commit_exec = IcebergCommitExec::new(
             table.clone(),
-            IcebergCatalogAccess::plain(catalog.clone()),
+            IcebergTableSource::refreshing(catalog.clone(), table.identifier().clone()),
             input_exec,
             arrow_schema,
         );

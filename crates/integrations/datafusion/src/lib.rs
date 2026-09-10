@@ -17,7 +17,6 @@
 
 mod catalog;
 pub use catalog::*;
-mod catalog_access;
 
 mod error;
 pub use error::*;

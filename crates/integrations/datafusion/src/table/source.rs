@@ -21,40 +21,56 @@ use iceberg::table::Table;
 use iceberg::transaction::Transaction;
 use iceberg::{Catalog, Result, SessionCatalog, SessionContext, TableIdent};
 
-/// Iceberg catalog access retained by a DataFusion table provider.
-///
-/// Unlike a catalog adapter, this type does not implement [`Catalog`]. Each
-/// operation dispatches directly to the API selected when the provider was
-/// constructed.
-#[derive(Clone, Debug)]
-pub(crate) enum IcebergCatalogAccess {
-    Plain(Arc<dyn Catalog>),
-    Session {
+/// The metadata lifetime and commit target for an Iceberg table provider.
+#[derive(Debug, Clone)]
+pub(crate) enum IcebergTableSource {
+    RefreshingCatalog {
+        catalog: Arc<dyn Catalog>,
+        table_ident: TableIdent,
+    },
+    ResolvedSession {
         catalog: Arc<dyn SessionCatalog>,
         context: Arc<SessionContext>,
+        table: Table,
     },
 }
 
-impl IcebergCatalogAccess {
-    pub(crate) fn plain(catalog: Arc<dyn Catalog>) -> Self {
-        Self::Plain(catalog)
+impl IcebergTableSource {
+    pub(crate) fn refreshing(catalog: Arc<dyn Catalog>, table_ident: TableIdent) -> Self {
+        Self::RefreshingCatalog {
+            catalog,
+            table_ident,
+        }
     }
 
-    pub(crate) fn session(catalog: Arc<dyn SessionCatalog>, context: Arc<SessionContext>) -> Self {
-        Self::Session { catalog, context }
+    pub(crate) fn resolved_session(
+        catalog: Arc<dyn SessionCatalog>,
+        context: Arc<SessionContext>,
+        table: Table,
+    ) -> Self {
+        Self::ResolvedSession {
+            catalog,
+            context,
+            table,
+        }
     }
 
-    pub(crate) async fn load_table(&self, ident: &TableIdent) -> Result<Table> {
+    pub(crate) async fn table_for_planning(&self) -> Result<Table> {
         match self {
-            Self::Plain(catalog) => catalog.load_table(ident).await,
-            Self::Session { catalog, context } => catalog.load_table(context, ident).await,
+            Self::RefreshingCatalog {
+                catalog,
+                table_ident,
+            } => catalog.load_table(table_ident).await,
+            Self::ResolvedSession { table, .. } => Ok(table.clone()),
         }
     }
 
     pub(crate) async fn commit(&self, transaction: Transaction) -> Result<Table> {
         match self {
-            Self::Plain(catalog) => transaction.commit(catalog.as_ref()).await,
-            Self::Session { catalog, context } => {
+            Self::RefreshingCatalog { catalog, .. } => transaction.commit(catalog.as_ref()).await,
+            Self::ResolvedSession {
+                catalog, context, ..
+            } => {
                 transaction
                     .commit_with_session(catalog.as_ref(), context)
                     .await

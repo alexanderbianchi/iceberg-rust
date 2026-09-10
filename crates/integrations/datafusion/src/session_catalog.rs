@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::catalog::{
-    AsyncCatalogProvider, CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider,
-    SchemaProvider,
+    AsyncCatalogProvider, AsyncSchemaProvider, CatalogProvider, MemoryCatalogProvider,
 };
 use datafusion::common::{DataFusionError, Result as DFResult, TableReference, not_impl_err};
 use datafusion::datasource::TableProvider;
@@ -53,10 +51,7 @@ impl IcebergSessionCatalogProvider {
 
 #[async_trait]
 impl AsyncCatalogProvider for IcebergSessionCatalogProvider {
-    async fn schema(
-        &self,
-        _name: &str,
-    ) -> DFResult<Option<Arc<dyn datafusion::catalog::AsyncSchemaProvider>>> {
+    async fn schema(&self, _name: &str) -> DFResult<Option<Arc<dyn AsyncSchemaProvider>>> {
         not_impl_err!("Iceberg session catalogs require resolve() with a SessionConfig")
     }
 
@@ -66,50 +61,65 @@ impl AsyncCatalogProvider for IcebergSessionCatalogProvider {
         config: &SessionConfig,
         catalog_name: &str,
     ) -> DFResult<Arc<dyn CatalogProvider>> {
-        let mut requested = HashMap::<String, HashSet<String>>::new();
-        for reference in references {
-            let reference_catalog = reference
+        let has_matching_reference = references.iter().any(|reference| {
+            reference
                 .catalog()
-                .unwrap_or(&config.options().catalog.default_catalog);
-            if reference_catalog != catalog_name {
-                continue;
-            }
-            let schema = reference
-                .schema()
-                .unwrap_or(&config.options().catalog.default_schema);
-            requested
-                .entry(schema.to_string())
-                .or_default()
-                .insert(reference.table().to_string());
-        }
-
-        if requested.is_empty() {
+                .unwrap_or(&config.options().catalog.default_catalog)
+                == catalog_name
+        });
+        if !has_matching_reference {
             return Ok(Arc::new(MemoryCatalogProvider::new()));
         }
+
         let context = config.get_extension::<SessionContext>().ok_or_else(|| {
             DataFusionError::Configuration(
                 "Iceberg SessionContext is required to resolve a session catalog".to_string(),
             )
         })?;
-        let resolved = MemoryCatalogProvider::new();
-        for (schema_name, table_names) in requested {
-            let namespace =
-                NamespaceIdent::from_strs([&schema_name]).map_err(to_datafusion_error)?;
-            let schema = Arc::new(MemorySchemaProvider::new());
-            for table_name in table_names {
-                let provider = load_table_provider(
-                    Arc::clone(&self.catalog),
-                    Arc::clone(&context),
-                    namespace.clone(),
-                    &table_name,
-                )
-                .await?;
-                schema.register_table(table_name, provider)?;
-            }
-            resolved.register_schema(&schema_name, schema)?;
-        }
+        let bound = BoundIcebergCatalogProvider {
+            catalog: Arc::clone(&self.catalog),
+            context,
+        };
 
-        Ok(Arc::new(resolved))
+        AsyncCatalogProvider::resolve(&bound, references, config, catalog_name).await
+    }
+}
+
+#[derive(Debug)]
+struct BoundIcebergCatalogProvider {
+    catalog: Arc<dyn SessionCatalog>,
+    context: Arc<SessionContext>,
+}
+
+#[async_trait]
+impl AsyncCatalogProvider for BoundIcebergCatalogProvider {
+    async fn schema(&self, name: &str) -> DFResult<Option<Arc<dyn AsyncSchemaProvider>>> {
+        Ok(Some(Arc::new(BoundIcebergSchemaProvider {
+            catalog: Arc::clone(&self.catalog),
+            context: Arc::clone(&self.context),
+            namespace: NamespaceIdent::new(name.to_string()),
+        })))
+    }
+}
+
+#[derive(Debug)]
+struct BoundIcebergSchemaProvider {
+    catalog: Arc<dyn SessionCatalog>,
+    context: Arc<SessionContext>,
+    namespace: NamespaceIdent,
+}
+
+#[async_trait]
+impl AsyncSchemaProvider for BoundIcebergSchemaProvider {
+    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        load_table_provider(
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.context),
+            self.namespace.clone(),
+            name,
+        )
+        .await
+        .map(Some)
     }
 }
 
