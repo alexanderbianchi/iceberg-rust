@@ -303,31 +303,44 @@ changing its internal representation to a hash matcher is a separate decision.
 Equality keys must use Iceberg IDs, compatible types/defaults, and Iceberg null
 matching. Do not substitute ordinary SQL `NOT IN` semantics.
 
-DataFusion 55.x builds its native row filter from physical expressions. The
-inspected API does not expose a general extra per-file `ArrowPredicate` factory.
-A candidate DataFusion extension point is:
+### Compose an existing Parquet source first
+
+DataFusion 55.x builds its native row filter from physical expressions. First
+prototype an Iceberg `PhysicalExpr` matcher over shared prepared deletes and
+configure the existing `ParquetSource` with the combined delete and supported
+query predicates:
 
 ```rust
-// Proposed DataFusion integration hook, not an existing iceberg-rust API.
-trait RequiredParquetPredicateFactory: Send + Sync {
-    fn create(
-        &self,
-        context: &FileReadContext,
-    ) -> Result<Vec<Box<dyn ArrowPredicate>>>;
-}
+// Existing DataFusion APIs; constructing and binding the predicate is prototype work.
+parquet_source
+    .with_predicate(combined_predicate)
+    .with_pushdown_filters(true)
 ```
 
-The context must include physical binding information and the file's prepared
-state. Async delete loading precedes synchronous factory invocation. The hook
-must compose with native predicates, run even when optional filter pushdown is
-disabled, propagate errors, and survive decoder/morsel rebuilding. Sharing delete
-data must not imply sharing a mutable predicate instance between decoders.
+`with_predicate` replaces the source predicate, so composition must retain any
+existing query and live dynamic predicates. Async delete loading precedes
+synchronous expression evaluation. The matcher must expose its required columns
+and preserve prepared state through expression rewriting and decoder rebuilding.
 
-A custom DataFusion `PhysicalExpr` wrapping an Iceberg matcher is another option,
-but ordinary best-effort pushdown is insufficient: it can omit unsupported
-conjuncts or be disabled. A correct implementation must guarantee delete
-enforcement or retain a fallback before LIMIT. Post-decode matching remains a
-fallback, not the desired default integration.
+Prove two properties before relying on this approach:
+
+1. **Per-file binding.** A source normally serves multiple files, whose applicable
+   deletes and physical schemas can differ. Specialize the delegated read using
+   existing file/morsel interfaces, preserving native scheduling and shared delete
+   preparation. A scan-wide matcher must not apply one file's deletes to another.
+2. **Mandatory enforcement.** Enabling pushdown alone is insufficient. The current
+   row-filter construction can omit unsupported conjuncts or ignore construction
+   errors. Verify that the delete expression is evaluated, or retain a correct
+   fallback before any output limit. Disabling optional query-filter pushdown
+   must not disable deletes; query residuals must still be enforced separately.
+
+A new DataFusion hook is a fallback, not a prerequisite. Introduce one only if
+this prototype demonstrates that existing interfaces cannot safely express
+per-file binding or guaranteed enforcement. Such a hook would need to compose
+required predicates with native query predicates, propagate failures, and survive
+decoder/morsel rebuilding. Sharing prepared delete data must not imply sharing a
+mutable predicate instance between decoders. Post-decode matching remains a
+correctness fallback, not the preferred default integration.
 
 ## DataFusion integration
 
@@ -428,8 +441,9 @@ present in manifests.
    existing reader's semantics. Keep reader configuration separate from planning.
 2. Extract shared schema binding and delete preparation; keep ArrowReader using
    them. Introduce only the traits demonstrated necessary by actual consumers.
-3. Prototype native DataFusion Parquet execution, mandatory delete predicates,
-   and shared schema adaptation before committing to the public API shape.
+3. Prototype a configured native DataFusion Parquet source with an Iceberg delete
+   `PhysicalExpr` and shared schema adaptation. Prove per-file binding and mandatory
+   enforcement using existing interfaces before proposing a new DataFusion hook.
 4. Add dynamic pruning, validated ordering, and per-file/subset statistics using
    the same task and metadata representation.
 
@@ -442,9 +456,9 @@ Exercise cache sharing, cancellation, errors, and decoder reconstruction. Disabl
 query-filter pushdown must never disable deletes. Compare results and plans; make
 performance claims only after measuring representative workloads.
 
-Open decisions are the smallest DataFusion mandatory-predicate hook, how bindings
-reach its per-file expression adapter, ownership of selected metadata, and which
-parts merit a stable public API. No global format registry, generic non-Arrow
+Open decisions are whether existing DataFusion interfaces suffice for mandatory
+per-file predicates, how bindings reach its expression adapter, ownership of
+selected metadata, and which parts merit a stable public API. No global format registry, generic non-Arrow
 evaluator framework, or engine execution-plan abstraction is required initially.
 
 ## Related work
