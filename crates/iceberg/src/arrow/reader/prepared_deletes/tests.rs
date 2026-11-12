@@ -134,6 +134,46 @@ async fn cancelled_load_can_be_retried() {
 }
 
 #[test]
+fn equality_filter_projects_only_referenced_keys() {
+    use crate::expr::Reference;
+    use crate::spec::Datum;
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "unused",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "key",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let prepared = PreparedDeletes {
+        positions: DeleteVector::default(),
+        equality: Reference::new("key").not_equal_to(Datum::long(1)),
+        schema,
+        equality_ids: vec![1, 2],
+        case_sensitive: true,
+    };
+    let filter = prepared.equality_filter().unwrap().unwrap();
+    assert_eq!(filter.field_ids(), &[2]);
+    let batch = RecordBatch::try_new(filter.schema().clone(), vec![Arc::new(Int64Array::from(
+        vec![1, 2],
+    ))])
+    .unwrap();
+    assert_eq!(
+        filter.evaluate(batch).unwrap(),
+        BooleanArray::from(vec![false, true])
+    );
+}
+
+#[test]
 fn position_selection_preserves_file_coordinates_and_rejects_out_of_range() {
     let (_, _, task) = fixture(FirstLoad::Success);
     let mut positions = DeleteVector::default();

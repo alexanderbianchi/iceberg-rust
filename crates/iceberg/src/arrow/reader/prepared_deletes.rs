@@ -343,9 +343,17 @@ impl PreparedDeletes {
         let predicate = predicates.pop().ok_or_else(|| {
             Error::new(ErrorKind::Unexpected, "Missing equality-delete evaluator")
         })?;
+        let (indices, field_ids): (Vec<_>, Vec<_>) = self
+            .equality_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, id)| ids.contains(id))
+            .unzip();
+        let schema = Arc::new(schema.project(&indices)?);
         Ok(Some(EqualityDeleteFilter {
             schema,
-            field_ids: self.equality_ids.clone(),
+            field_ids,
             predicate: Mutex::new(predicate),
         }))
     }
