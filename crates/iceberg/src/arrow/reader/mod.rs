@@ -34,17 +34,21 @@ const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
 /// Matches DataFusion's default `ParquetOptions::metadata_size_hint`.
 const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
 
+mod binding;
 mod file_reader;
 mod options;
 mod pipeline;
 mod positional_deletes;
 mod predicate_visitor;
+mod prepared_deletes;
 mod projection;
 mod row_filter;
 mod row_lineage;
+pub use binding::{BoundReadField, FileReadBinding};
 pub use file_reader::ArrowFileReader;
 pub(crate) use options::ParquetReadOptions;
 use predicate_visitor::{CollectFieldIdVisitor, PredicateConverter};
+pub use prepared_deletes::{DeleteReadContext, EqualityDeleteFilter, PreparedDeletes};
 use projection::{
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
     find_leaf_by_field_id,

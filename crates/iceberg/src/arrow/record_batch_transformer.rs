@@ -472,7 +472,11 @@ impl RecordBatchTransformer {
                     .with_row_count(Some(record_batch.num_rows()));
                 RecordBatch::try_new_with_options(
                     Arc::clone(target_schema),
-                    self.transform_columns(record_batch.columns(), operations)?,
+                    self.transform_columns(
+                        record_batch.columns(),
+                        operations,
+                        record_batch.num_rows(),
+                    )?,
                     &options,
                 )?
             }
@@ -914,16 +918,24 @@ impl RecordBatchTransformer {
         Ok(field_id_to_source_schema)
     }
 
-    fn transform_columns(
+    pub(crate) fn bind_columns(&self, source_schema: &ArrowSchemaRef) -> Result<Vec<ColumnSource>> {
+        let target_schema = Arc::new(schema_to_arrow_schema(&self.snapshot_schema)?);
+        Self::generate_transform_operations(
+            source_schema,
+            &self.snapshot_schema,
+            &self.projected_iceberg_field_ids,
+            Self::build_field_id_to_arrow_schema_map(&target_schema)?,
+            &self.constant_fields,
+            &self.virtual_fields,
+        )
+    }
+
+    pub(crate) fn transform_columns(
         &self,
         columns: &[Arc<dyn ArrowArray>],
         operations: &[ColumnSource],
+        num_rows: usize,
     ) -> Result<Vec<Arc<dyn ArrowArray>>> {
-        if columns.is_empty() {
-            return Ok(columns.to_vec());
-        }
-        let num_rows = columns[0].len();
-
         operations
             .iter()
             .map(|op| {

@@ -213,6 +213,14 @@ impl FileScanTask {
         self.predicate.as_ref()
     }
 
+    /// Removes the row predicate when the caller enforces the residual independently.
+    ///
+    /// Delete-file application and all other task semantics are unchanged.
+    pub fn without_predicate(mut self) -> Self {
+        self.predicate = None;
+        self
+    }
+
     /// Clears the row predicate of this file scan task.
     ///
     /// The COW rewrite path uses this after candidate selection: candidates are

@@ -79,6 +79,37 @@ pub fn iceberg::arrow::ArrowReaderBuilder::with_range_coalesce_bytes(self, range
 pub fn iceberg::arrow::ArrowReaderBuilder::with_range_fetch_concurrency(self, range_fetch_concurrency: usize) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_row_group_filtering_enabled(self, row_group_filtering_enabled: bool) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_row_selection_enabled(self, row_selection_enabled: bool) -> Self
+pub struct iceberg::arrow::BoundReadField
+impl iceberg::arrow::BoundReadField
+pub fn iceberg::arrow::BoundReadField::constant(&self) -> core::option::Option<&arrow_array::array::ArrayRef>
+pub fn iceberg::arrow::BoundReadField::data_type(&self) -> &arrow_schema::datatype::DataType
+pub fn iceberg::arrow::BoundReadField::source_index(&self) -> core::option::Option<usize>
+impl core::clone::Clone for iceberg::arrow::BoundReadField
+pub fn iceberg::arrow::BoundReadField::clone(&self) -> iceberg::arrow::BoundReadField
+impl core::fmt::Debug for iceberg::arrow::BoundReadField
+pub fn iceberg::arrow::BoundReadField::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct iceberg::arrow::DeleteReadContext
+impl iceberg::arrow::DeleteReadContext
+pub fn iceberg::arrow::DeleteReadContext::new(loader: alloc::sync::Arc<(dyn iceberg::arrow::delete_file_loader::DeleteFileLoader + core::marker::Send + core::marker::Sync)>, file_io: iceberg::io::FileIO, schema: iceberg::spec::SchemaRef) -> Self
+pub async fn iceberg::arrow::DeleteReadContext::prepare(&self, task: &iceberg::scan::FileScanTask) -> iceberg::Result<iceberg::arrow::PreparedDeletes>
+impl core::fmt::Debug for iceberg::arrow::DeleteReadContext
+pub fn iceberg::arrow::DeleteReadContext::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct iceberg::arrow::EqualityDeleteFilter
+impl iceberg::arrow::EqualityDeleteFilter
+pub fn iceberg::arrow::EqualityDeleteFilter::evaluate(&self, batch: arrow_array::record_batch::RecordBatch) -> iceberg::Result<arrow_array::array::boolean_array::BooleanArray>
+pub fn iceberg::arrow::EqualityDeleteFilter::field_ids(&self) -> &[i32]
+pub fn iceberg::arrow::EqualityDeleteFilter::schema(&self) -> &arrow_schema::schema::SchemaRef
+impl core::fmt::Debug for iceberg::arrow::EqualityDeleteFilter
+pub fn iceberg::arrow::EqualityDeleteFilter::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct iceberg::arrow::FileReadBinding
+impl iceberg::arrow::FileReadBinding
+pub fn iceberg::arrow::FileReadBinding::field(&self, field_id: i32) -> iceberg::Result<iceberg::arrow::BoundReadField>
+pub fn iceberg::arrow::FileReadBinding::new(task: alloc::sync::Arc<iceberg::scan::FileScanTask>, physical_schema: arrow_schema::schema::SchemaRef) -> iceberg::Result<Self>
+pub fn iceberg::arrow::FileReadBinding::physical_schema(&self) -> &arrow_schema::schema::SchemaRef
+impl core::clone::Clone for iceberg::arrow::FileReadBinding
+pub fn iceberg::arrow::FileReadBinding::clone(&self) -> iceberg::arrow::FileReadBinding
+impl core::fmt::Debug for iceberg::arrow::FileReadBinding
+pub fn iceberg::arrow::FileReadBinding::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::arrow::PartitionValueCalculator
 impl iceberg::arrow::PartitionValueCalculator
 pub fn iceberg::arrow::PartitionValueCalculator::calculate(&self, batch: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<arrow_array::array::ArrayRef>
@@ -87,6 +118,14 @@ pub fn iceberg::arrow::PartitionValueCalculator::partition_type(&self) -> &icebe
 pub fn iceberg::arrow::PartitionValueCalculator::try_new(partition_spec: &iceberg::spec::PartitionSpec, table_schema: &iceberg::spec::Schema) -> iceberg::Result<Self>
 impl core::fmt::Debug for iceberg::arrow::PartitionValueCalculator
 pub fn iceberg::arrow::PartitionValueCalculator::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct iceberg::arrow::PreparedDeletes
+impl iceberg::arrow::PreparedDeletes
+pub fn iceberg::arrow::PreparedDeletes::equality_filter(&self) -> iceberg::Result<core::option::Option<iceberg::arrow::EqualityDeleteFilter>>
+pub fn iceberg::arrow::PreparedDeletes::has_position_deletes(&self) -> bool
+pub fn iceberg::arrow::PreparedDeletes::position_selection(&self, record_count: u64) -> iceberg::Result<core::option::Option<parquet::arrow::arrow_reader::selection::RowSelection>>
+pub fn iceberg::arrow::PreparedDeletes::row_selection(&self, task: &iceberg::scan::FileScanTask, metadata: &alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>) -> iceberg::Result<core::option::Option<parquet::arrow::arrow_reader::selection::RowSelection>>
+impl core::fmt::Debug for iceberg::arrow::PreparedDeletes
+pub fn iceberg::arrow::PreparedDeletes::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::arrow::RecordBatchPartitionSplitter
 impl iceberg::arrow::RecordBatchPartitionSplitter
 pub fn iceberg::arrow::RecordBatchPartitionSplitter::split(&self, batch: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<alloc::vec::Vec<(iceberg::spec::PartitionKey, arrow_array::record_batch::RecordBatch)>>
@@ -1351,6 +1390,7 @@ pub fn iceberg::scan::FileScanTask::sort_order(&self) -> core::option::Option<&i
 pub fn iceberg::scan::FileScanTask::sort_order_id(&self) -> core::option::Option<i32>
 pub fn iceberg::scan::FileScanTask::start(&self) -> u64
 pub fn iceberg::scan::FileScanTask::unified_partition_type(&self) -> core::option::Option<&alloc::sync::Arc<iceberg::spec::StructType>>
+pub fn iceberg::scan::FileScanTask::without_predicate(self) -> Self
 impl core::clone::Clone for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::clone(&self) -> iceberg::scan::FileScanTask
 impl core::cmp::PartialEq for iceberg::scan::FileScanTask

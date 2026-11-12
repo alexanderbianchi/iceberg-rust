@@ -337,7 +337,7 @@ impl CachingDeleteFileLoader {
     /// Both builder construction and deserialization validate the task's required fields.
     /// The fallible extraction here converts the optional fields into values for the
     /// byte-range read, preserving `DataInvalid` errors instead of unwrapping them.
-    fn validate_deletion_vector_task(
+    pub(crate) fn validate_deletion_vector_task(
         task: &FileScanTaskDeleteFile,
     ) -> Result<(u64, u64, String, u64)> {
         let content_offset = task.content_offset().ok_or_else(|| {
@@ -376,7 +376,7 @@ impl CachingDeleteFileLoader {
 
     /// Validates a decoded deletion vector's cardinality against the manifest entry's
     /// `record_count`, mirroring Iceberg-Java's `BitmapPositionDeleteIndex.deserializeBitmap`.
-    fn validate_deletion_vector_cardinality(
+    pub(crate) fn validate_deletion_vector_cardinality(
         delete_vector: &DeleteVector,
         expected: u64,
         dv_path: &str,
@@ -481,7 +481,7 @@ impl CachingDeleteFileLoader {
     /// Parses a record batch stream coming from positional delete files
     ///
     /// Returns a map of data file path to a delete vector
-    async fn parse_positional_deletes_record_batch_stream(
+    pub(crate) async fn parse_positional_deletes_record_batch_stream(
         mut stream: ArrowRecordBatchStream,
     ) -> Result<HashMap<String, DeleteVector>> {
         let mut result: HashMap<String, DeleteVector> = HashMap::default();
@@ -578,7 +578,7 @@ impl CachingDeleteFileLoader {
         }
     }
 
-    async fn parse_equality_deletes_record_batch_stream(
+    pub(crate) async fn parse_equality_deletes_record_batch_stream(
         mut stream: ArrowRecordBatchStream,
         equality_ids: HashSet<i32>,
     ) -> Result<Predicate> {
