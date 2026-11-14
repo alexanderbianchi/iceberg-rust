@@ -953,7 +953,11 @@ mod tests {
     ) -> crate::Result<Vec<RecordBatch>> {
         let tasks = futures::stream::iter(tasks.into_iter().map(Ok));
         ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
-            .with_data_file_concurrency_limit(concurrency)
+            .with_options(
+                ReaderOptions::builder()
+                    .with_data_file_concurrency_limit(concurrency)
+                    .build(),
+            )
             .build()
             .read(Box::pin(tasks))?
             .stream()

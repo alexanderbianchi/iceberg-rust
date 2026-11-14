@@ -155,7 +155,8 @@ pub struct ParquetReadOptions {
     preload_column_index: bool,
     #[builder(default = true)]
     preload_offset_index: bool,
-    // Execution derives page-index preloading per file from predicates and deletes.
+    /// Stored page-index flag; the reader derives preloading per data file from
+    /// the predicate and delete files, overriding this value.
     #[builder(default = false)]
     preload_page_index: bool,
 }
@@ -182,7 +183,10 @@ impl ParquetReadOptions {
         self.preload_offset_index
     }
 
-    /// Returns whether to preload the page index when reading Parquet metadata.
+    /// Returns the stored page-index flag.
+    ///
+    /// The reader ignores this value: page-index preloading is derived per data
+    /// file from the predicate and delete files.
     pub fn preload_page_index(&self) -> bool {
         self.preload_page_index
     }
